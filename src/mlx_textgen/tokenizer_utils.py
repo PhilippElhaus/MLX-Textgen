@@ -1,10 +1,11 @@
 # adapted from mlx-lm
 import json
 from functools import partial
-from typing import List, Optional, Dict, Any
-from logging import Logger
-from transformers import AutoTokenizer, PreTrainedTokenizer
-from huggingface_hub import hf_hub_download
+from abc import ABC, abstractmethod
+from typing import List, Optional, Dict, Any, TYPE_CHECKING
+if TYPE_CHECKING:
+    from logging import Logger
+    from transformers import PreTrainedTokenizer
 
 REPLACEMENT_CHAR = "\ufffd"
 SPECIAL_SPACE = "\u2581"
@@ -15,9 +16,29 @@ def _remove_space(x):
     return x
 
 
-class NaiveDetokenizer:
+class BaseDetokenizer:
+    
+    @abstractmethod
+    def reset(self, num_seqs: Optional[int] = None) -> None:
+        pass
 
-    def __init__(self, tokenizer: PreTrainedTokenizer) -> None:
+    @abstractmethod
+    def add_tokens(self, token_ids: List[List[int]]) -> None:
+        pass
+
+    @abstractmethod
+    def finalize(self) -> None:
+        pass    
+
+    @property
+    @abstractmethod
+    def last_segments(self) -> List[str]:
+        pass
+
+class NaiveDetokenizer(BaseDetokenizer):
+    """Detokenizer for streaming.
+    """
+    def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
         self._tokenizer = tokenizer
         self.reset()
 
@@ -57,14 +78,14 @@ class NaiveDetokenizer:
         new_segments = list(new_segments)
         return new_segments
 
-class SPMDetokenizer:
+class SPMDetokenizer(BaseDetokenizer):
     """A streaming detokenizer for SPM models.
 
     It adds tokens to the text if the next token starts with the special SPM
     underscore which results in linear complexity.
     """
 
-    def __init__(self, tokenizer: PreTrainedTokenizer, trim_space=True):
+    def __init__(self, tokenizer: "PreTrainedTokenizer", trim_space=True):
         self.trim_space = trim_space
         self.eos_token = tokenizer.eos_token
 
@@ -112,7 +133,7 @@ class SPMDetokenizer:
         token_conditions = [((rt[0] == SPECIAL_SPACE), (tid[0] in self.hexcode_tokens)) for rt, tid in zip(raw_tokens, token_ids)]
         self.segments = [self._get_text_token(tid, rt, tc, i) for tid, rt, tc, i in zip(token_ids, raw_tokens, token_conditions, self.range)]
 
-    def finalize(self):
+    def finalize(self) -> None:
         hex_str = [('' if len(self.hexcodes[index]) == 0 else bytes(self.hexcodes[index]).decode()) for index in self.range]
         self.segments = [s + hs for s, hs in zip(self.segments, hex_str)]
 
@@ -131,7 +152,7 @@ class TokenizerWrapper:
     huggingface tokenizer.
     """
 
-    def __init__(self, tokenizer, detokenizer_class=NaiveDetokenizer):
+    def __init__(self, tokenizer: "PreTrainedTokenizer", detokenizer_class: "BaseDetokenizer" = NaiveDetokenizer) -> None:
         self._tokenizer = tokenizer
         self._detokenizer_class = detokenizer_class
         self._detokenizer = detokenizer_class(tokenizer)
@@ -194,18 +215,22 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def load_tokenizer(model_path, tokenizer_config_extra: Optional[Dict[str, Any]] = None, logger: Optional[Logger] = None):
+def load_tokenizer(model_path: str, tokenizer_config_extra: Optional[Dict[str, Any]] = None, logger: Optional["Logger"] = None) -> TokenizerWrapper:
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
 
     Note, to use a fast streaming tokenizer, pass a local file path rather than
     a Hugging Face repo ID.
     """
+    import os
+    from transformers import AutoTokenizer
+    from huggingface_hub import hf_hub_download
+
     tokenizer_config_extra = dict() if tokenizer_config_extra is None else tokenizer_config_extra
     detokenizer_class = NaiveDetokenizer
 
-    tokenizer_file = model_path / "tokenizer.json"
-    if not tokenizer_file.exists():
+    tokenizer_file = os.path.join(model_path, "tokenizer.json")
+    if not os.path.exists(tokenizer_file):
         tokenizer_file = hf_hub_download(repo_id=str(model_path), filename='tokenizer.json')
     with open(tokenizer_file, "r") as fid:
         tokenizer_content = json.load(fid)

@@ -3,7 +3,7 @@
 [![PyPI - License](https://img.shields.io/pypi/l/mlx-textgen)](https://pypi.org/project/mlx-textgen/)
 [![GitHub Repo stars](https://img.shields.io/github/stars/nath1295/mlx-textgen)](https://pypi.org/project/mlx-textgen/)
 
-## An OpenAI-compatible API LLM engine with smart prompt caching, batch processing, structured output with guided decoding, and function calling for all models using MLX  
+## An OpenAI-compatible API LLM engine with smart prompt caching, batch processing, structured output with guided decoding, and function calling for models using MLX  
 
 MLX-Textgen is a light-weight LLM serving engine that utilize MLX and a smart KV cache management system to make your LLM generation more seamless on your Apple silicon machine. It features:
 - **Multiple KV-cache slots to reduce the needs of prompt processing**
@@ -13,13 +13,16 @@ MLX-Textgen is a light-weight LLM serving engine that utilize MLX and a smart KV
 - **Common OpenAI API endpoints: `/v1/models`, `/v1/completions`, `/v1/chat/completions`**
 
 It is built with:
-1. [mlx-lm](https://github.com/ml-explore/mlx-examples)
-2. [Outlines](https://github.com/dottxt-ai/outlines)
-3. [FastAPI](https://github.com/fastapi/fastapi)
+1. [mlx-lm](https://github.com/ml-explore/mlx-lm)
+2. [mlx-vlm](https://github.com/Blaizzy/mlx-vlm)
+3. [Outlines](https://github.com/dottxt-ai/outlines)
+4. [FastAPI](https://github.com/fastapi/fastapi)
 
 ## Updates
-- **2024-10-20:** Batch inference and function calling supported. Breaking changes in the save format for the KV caches. Run `mlx_textgen.clear_cache` after updating to avoid issues.
-- **2024-10-07:** Guided decoding is supported with [Outlines](https://github.com/dottxt-ai/outlines) backend.
+- **2025-06-21:** Some vision models supported with `mlx-vlm` integration. Tested with Gemma 3 family models and Mistral Small 3.1.
+- **2025-06-21:** Reasoning parser supported for reasoning models with `deepseek_r1` parser.
+- **2025-06-21:** Breaking changes due to new vision model support and code restructuring. Run `mlx_texgen createconfig` to create a new config file.
+- **2025-06-21:** Quantising models will need to be done manually with `mlx-lm` or `mlx-vlm`.
 
 ## Installing MLX-Textgen
 MLX-textgen can be easily installed with `pip`:
@@ -32,44 +35,57 @@ pip install mlx-textgen
 You can quickly set up a OpenAI API server with a single command.
 
 ```bash
-mlx_textgen.server --model NousResearch/Hermes-3-Llama-3.1-8B --qunatize q8 --port 5001 --host 127.0.0.1
+mlx_textgen serve --model-path mlx-community/gemma-3-4b-it-8bit --port 5001
 ```
 
 ### 2. Serving a multiple models server
 Create a config file template and add as many model as you like.
 ```bash
-mlx_textgen.create_config --num-models 2
+mlx_textgen createconfig --num-models 2
 ```
 
 It will generate a file called `model_config.yaml`. Edit this file for the models you want to serve.
 ```yaml
-- model_id_or_path: NousResearch/Hermes-3-Llama-3.1-8B
-  tokenizer_id_or_path: null
-  adapter_path: null
-  quant: q8
-  revision: null
+model_configs:
+- model_id_or_path: /path/to/model_0
+  tokenizer_repo_or_path: null
+  model_kwargs: null
+  tokenizer_kwargs: null
   model_name: null
-  model_config: null
-  tokenizer_config: null
-- model_id_or_path: mlx-community/Llama-3.2-3B-Instruct-4bit
-  tokenizer_id_or_path: null
-  adapter_path: null
-  quant: q4
-  revision: null
-  model_name: llama-3.2-3b-instruct
-  model_config: null
-  tokenizer_config: null
+  enable_cache: true
+  preprocess_batch_size: 512
+  extra_stop_words: null
+  reasoning_parser: null
+  default_template: null
+- model_id_or_path: /path/to/model_1
+  tokenizer_repo_or_path: null
+  model_kwargs: null
+  tokenizer_kwargs: null
+  model_name: null
+  enable_cache: true
+  preprocess_batch_size: 512
+  extra_stop_words: null
+  reasoning_parser: null
+  default_template: null
+host: 127.0.0.1
+port: 5001
+api_keys: null
+min_tokens: 20
+max_reprocess_tokens: 250
+replace_threshold: 0.95
+max_capacity: 50
+use_reasoning_content: false
 ```
 
 Then start the engine:
 ```bash
-mlx_textgen.server --config-file ./model_config.yaml --port 5001 --host 127.0.0.1
+mlx_textgen serve --config-file ./model_config.yaml
 ```
 
 ### 3. More engine arguments
 You can check the details of other engine arguments by running:
 ```bash
-mlx_textgen.server --help
+mlx_textgen serve --help
 ```
 
 You can specify the number of cache slots for each model, minimum number of tokens to create a cache file, and API keys etc.
@@ -118,7 +134,7 @@ tools = [{
 client = OpenAI(api_key='Your API Key', base_url='http://localhost:5001/v1/')
 
 output = client.chat.completions.create(
-    model='my_llama_model',
+    model='model_name',
     messages=[
         dict(role='user', content='What is the current weather in London?')
     ],
@@ -146,37 +162,6 @@ If `tool_choice="none"` is passed, the list of tools provided will be ignored an
 
 ### 5. Multiple LLMs serving
 Only one model is loaded on ram at a time, but the engine leverage MLX fast module loading time to spin up another model when it is requested. This allows serving multiple models with one endpoint.
-
-### 6. Automatic model quantisation
-When configuring your model, you can specify the quantisation to increase your inference speed and lower memory usage. The original model is converted to MLX quantised model format when initialising the serving engine.
-
-```python
-from pydantic import BaseModel
-from openai import OpenAI
-
-client = OpenAI(api_key='Your API Key', base_url='http://localhost:5001/v1/')
-
-class Customer(BaseModel):
-    first_name: str
-    last_name: str
-    age: int
-
-prompt = """Extract the customer information from the following text in json format:
-"...The customer David Stone join our membership in 20023, his current age is thirty five years old...."
-"""
-for i in client.chat.completions.create(
-    model='my_llama_model',
-    messages=[dict(role='user', content=prompt)],
-    max_tokens=200,
-    stream=True,
-    extra_body=dict(
-        guided_json=Customer.model_json_schema()
-    )
-):
-    print(i.choices[0].delta.content, end='')
-
-# Output: {"first_name": "David", "last_name": "Stone", "age": 35}
-```
 
 ## License
 This project is licensed under the terms of the MIT license.

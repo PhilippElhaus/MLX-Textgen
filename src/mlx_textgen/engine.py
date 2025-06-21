@@ -1,266 +1,112 @@
-from mlx_lm.tokenizer_utils import TokenizerWrapper
-from mlx.nn import Module
-from datetime import datetime as dt
-import time
-import uuid
-import mlx.core as mx
-from .cache_utils import CacheHistory, make_empty_cache
-from .model_utils import package_cache_dir, get_model_and_tokenizer, ModelConfig, get_model_name, make_model_exist
-from .generate_utils import (
-    generate, 
-    stream_generate, 
-    remove_bos_duplicates,
-    get_choice_processor, 
-    get_json_processor, 
-    get_regex_processor, 
-    get_grammar_processor,
-    GenerationOutput, 
-    OUTLINE_INSTALLED
-    )
-from .chat_utils import ChatTemplate, convert_tool_to_json_schema, get_tool_name
-from .caching import CacheManager
-from logging import Logger
-from pydantic import BaseModel, Field, field_validator
-import os
-from typing import Optional, List, Dict, Union, Literal, Any, Iterator, Generator
-if OUTLINE_INSTALLED:
-    from outlines.models.transformers import TransformerTokenizer
-    from outlines.processors.base_logits_processor import OutlinesLogitsProcessor
+from typing import List, Dict, Optional, Any, Literal, Union, Iterator, TYPE_CHECKING
+from .chat_utils import DEFAULT_TEMPLATES
+from pydantic import BaseModel
+if TYPE_CHECKING:
+    from logging import Logger
+    from .model_utils import LLMModel
+    from .generation_utils import TextCompletionOutput, ChatCompletionOutput
 
-def get_return_dict(
-        generation_outputs: List[GenerationOutput], 
-        id: str, model: str, 
-        completion_type: Literal['text_completion', 'chat.completion'], 
-        created: float,
-        stream: bool,
-        indices: Optional[List[int]] = None,
-        tool_start: Optional[str] = None,
-        tool_call_id: Optional[str] = None,
-        tool_name: Optional[str] = None,
-        tool_arguments: Optional[str] = None
-    ) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
-    num_outputs = len(generation_outputs)
-    indices = indices if indices else range(num_outputs)
-    if num_outputs != len(indices):
-        raise Exception('Indices length mistmatch.')
-    if completion_type == 'text_completion':
-        choices = [dict(index=i, finish_reason=go.finish_reason if go.stop_text != tool_start else 'tool_call_start', text=go.text) for i, go in zip(indices, generation_outputs)]
-        if stream:
-            out_dicts = [dict(
-            id='cmpl-'+id, 
-            object=completion_type, 
-            created=created,
-            model=model,
-            choices=[c]
-            ) for c in choices]
+def print_images_list(images: List):
+    new = []
+    for i in images:
+        if isinstance(i, list):
+            new.append(print_images_list(i))
+        elif isinstance(i, str):
+            new.append(i[:50])
         else:
-            tokens = [len(go.token_ids.tolist()) for go in generation_outputs]
-            prompt_tokens = sum([go.input_tokens for go in generation_outputs])
-            total_tokens = sum(tokens)
-            out_dicts = dict(id='cmpl-'+id, 
-            object=completion_type, 
-            created=created,
-            model=model, 
-            choices=choices,
-            usage=dict(
-                total_tokens=total_tokens,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=total_tokens-prompt_tokens
-            )
-        )
-        return out_dicts
-    elif ((completion_type == 'chat.completion') and (stream)):
-        return [dict(
-            id='chatcmpl-'+id, 
-            object=completion_type + '.chunk', 
-            created=created, 
-            model=model, 
-            choices=[
-                dict(
-                    index=i, 
-                    finish_reason=(go.finish_reason if go.stop_text != tool_start else 'tool_call_start') if tool_call_id is None else 'tool_calls', 
-                    delta=dict(
-                        role="assistant",
-                        content=go.text if tool_call_id is None else None,
-                        tool_calls=[] if tool_call_id is None else [
-                                {
-                                    "index": 0,
-                                    "id": f'call_{tool_call_id}',
-                                    "function": {
-                                        "arguments": tool_arguments,
-                                        "name": tool_name
-                                    },
-                                    "type": 'function'
-                                }
-                            ]
-                    )
-                )
-            ]
-        ) for i, go in zip(indices, generation_outputs)]
-    elif completion_type == 'chat.completion':
-        tokens = [len(go.token_ids.tolist()) for go in generation_outputs]
-        prompt_tokens = sum([go.input_tokens for go in generation_outputs])
-        total_tokens = sum(tokens)
-        return dict(
-            id='chatcmpl-'+id, 
-            object=completion_type, 
-            created=created, 
-            model=model, 
-            usage=dict(
-                total_tokens=total_tokens,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=total_tokens-prompt_tokens
-            ), 
-            choices=[
-                dict(
-                    index=i, 
-                    message=dict(
-                        role="assistant", 
-                        content=go.text if tool_call_id is None else None,
-                        tool_calls=[] if tool_call_id is None else [
-                                {
-                                    "index": 0,
-                                    "id": f'call_{tool_call_id}',
-                                    "function": {
-                                        "arguments": tool_arguments,
-                                        "name": tool_name
-                                    },
-                                    "type": 'function'
-                                }
-                            ]
-                    ),
-                    finish_reason=(go.finish_reason if go.stop_text != tool_start else 'tool_call_start') if tool_call_id is None else 'tool_calls'
-                )
-            for i, go in enumerate(generation_outputs)]
-        )
+            new.append(i)
+    return new
 
-class TextCompletionInput(BaseModel):
-    model: str
-    prompt: Union[str, List[str]]
-    stream: bool = False
-    stop: Optional[List[str]] = None
-    max_tokens: int = Field(default=4096, ge=1, le=32000)
-    n: int = Field(default=1, ge=1)
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    repetition_penalty: Optional[float] = Field(default=None, gt=0.0, le=2.0)
-    repetition_context_size: Optional[int] = Field(default=100, ge=1)
-    top_p: float = Field(default=1.0, gt=0.0, le=1.0)
-    min_p: float = Field(default=0.0, ge=0.0, le=1.0)
-    min_tokens_to_keep: int = Field(default=1, ge=1)
-    logit_bias: Optional[Dict[int, float]] = None
-    seed: Optional[int] = None
-    guided_json: Optional[Union[str, dict]] = None
-    guided_choice: Optional[List[str]] = None
-    guided_regex: Optional[str] = None
-    guided_grammar: Optional[str] = None
-    guided_whitespace_pattern: Optional[str] = None
+class ModelConfig(BaseModel):
+    model_id_or_path: str
+    tokenizer_repo_or_path: Optional[str] = None
+    model_kwargs: Optional[Dict[str, Any]] = None
+    tokenizer_kwargs: Optional[Dict[str, Any]] = None
+    model_name: Optional[str] = None
+    enable_cache: bool = True
+    preprocess_batch_size: int = 512
+    extra_stop_words: Optional[Union[str, List[str]]] = None
+    reasoning_parser: Optional[Literal['deepseek_r1']] = None
+    default_template: Optional[DEFAULT_TEMPLATES] = None
 
-    @field_validator('prompt')
-    def check_prompt(cls, v):
-        if isinstance(v, str) and not v.strip():
-            raise ValueError('Prompt cannot be an empty string.')
-        if isinstance(v, list) and not v:
-            raise ValueError('Prompt cannot be an empty list.')
-        return v
+def get_model_name(model_id_or_path: str, model_name: Optional[str] = None) -> str:
+        if model_name:
+             return model_name
+        name = model_id_or_path.split('/')[-1].split('\\')[-1]
+        name = name.lower().replace('_', '-')
+        if 'bit' in name.split('-')[-1]:
+            name = '-'.join(name.split('-')[:-1])
+        return name
 
-class ChatCompletionInput(BaseModel):
-    model: str
-    messages: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]]
-    stream: bool = False
-    stop: Optional[List[str]] = None
-    max_tokens: int = Field(default=4096, ge=1, le=32000)
-    n: int = Field(default=1, ge=1)
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    repetition_penalty: Optional[float] = Field(default=None, gt=0.0, le=2.0)
-    repetition_context_size: Optional[int] = Field(default=100, ge=1)
-    top_p: float = Field(default=1.0, gt=0.0, le=1.0)
-    min_p: float = Field(default=0.0, ge=0.0, le=1.0)
-    min_tokens_to_keep: int = Field(default=1, ge=1)
-    logit_bias: Optional[Dict[int, float]] = None
-    seed: Optional[int] = None
-    guided_json: Optional[Union[str, dict]] = None
-    guided_choice: Optional[List[str]] = None
-    guided_regex: Optional[str] = None
-    guided_grammar: Optional[str] = None
-    guided_whitespace_pattern: Optional[str] = None
-    tools: Optional[List[Dict[str, Any]]] = None
-    tool_choice: Union[Literal['none', 'auto', 'required'], Dict[str, Union[str, Dict[str, str]]]] = 'auto'
+class InferenceEngine:
 
-    @field_validator('messages')
-    def check_messages(cls, v):
-        if isinstance(v, list) and len(v) == 0:
-            raise ValueError('Messages cannot be an empty list.')
-        for msgs in v:
-            if len(msgs) == 0:
-                raise ValueError('Messages cannot be an empty list.')
-        return v
-
-class ModelEngine:
-
-    def __init__(self, 
-            models: Union[ModelConfig, List[ModelConfig]],
-            prefill_step_size: int = 512,
-            token_threshold: int = 20,
-            save_similarity_threshold: float = 0.9,
-            max_keep: int = 50,
-            verbose: bool = True,
-            logger: Optional[Logger] = None
-        ) -> None:
-        """Initialising the engine.
-
-        Args:
-            models (Union[ModelConfig, List[ModelConfig]]): Model configurations or list of model configurations to serve.
-            prefill_step_size (int, optional): Batch size for prompt preprocessing. Defaults to 512.
-            token_threshold (int, optional): Minimum number of tokens to be considered to save as a prompt cache history. Defaults to 20.
-            max_keep (int, optional): Maximum number of cache history files to keep. Defaults to 50.
-            logger (Optional[Logger], optional): If a logger is provided, messages of adding and deleting caches will be added.
-        """
-        self.model_configs = [models] if isinstance(models, ModelConfig) else models
-        self.prefill_step_size = prefill_step_size
-        self.token_threshold = token_threshold
-        self.save_sim_threshold = save_similarity_threshold
-        self.max_keep = max_keep
-        self.verbose = verbose
-        self.logger = logger
-        self.models: Dict[str, ModelConfig] = dict()
-        self.model: Optional[Module] = None
-        self.tokenizer: Optional[TokenizerWrapper] = None
-        self.current_model: Optional[str] = None
-        self.cache_manager: Optional[CacheManager] = None
-        self.outlines_tokenizer: Optional[TransformerTokenizer] = None
-        self.chat_template: Optional[ChatTemplate] = None
-        self.cache_dir = os.path.join(package_cache_dir, 'prompt_cache')
-        for model_config in self.model_configs:
-            self._prepare_model(model_config=model_config)
-        self.model_info = [self._get_model_info(k, v) for k, v in self.models.items()]
-
-    def _prepare_model(self, model_config: ModelConfig) -> None:
-        """Making sure the given model is available locally.
-
-        Args:
-            model_config (ModelConfig): Model configuaration of the model to check.
-        """
-        model_path = model_config.model_id_or_path
-        adapter_path = model_config.adapter_path
-        quant = model_config.quant
-        model_name = model_config.model_name
-        if model_name is None:
-            model_name = get_model_name(model_path)
-            if quant != 'fp16':
-                model_name += f'-{quant}'
-            if adapter_path:
-                model_name += f'-{get_model_name(adapter_path)}'
-        if model_name in self.models.keys():
-            if self.logger:
-                self.logger.error(f'Model "{model_name}" already exists. If there are different configurations with the same model name, please use a different model name.')
-                return
+    def __init__(self,
+            model_configs: List[ModelConfig],
+            min_tokens: int = 20,
+            max_reprocess_tokens: int = 250,
+            replace_threshold: float = 0.95,
+            max_capacity: int = 50,
+            use_reasoning_content: bool = False,
+            logger: Optional["Logger"] = None
+        ):
+        self._logger = logger
+        self._use_reasoning_content = use_reasoning_content
+        from .model_utils import make_model_exist
+        import time
+        start = time.perf_counter()
+        self._model_dict = dict()
+        for mc in model_configs:
+            model_name = get_model_name(mc.model_id_or_path, mc.model_name)
+            if model_name not in self._model_dict:
+                self._model_dict[model_name] = mc
+                kwargs = mc.model_kwargs if mc.model_kwargs else dict()
+                make_model_exist(model_id_or_path=mc.model_id_or_path, **kwargs)
             else:
-                raise ValueError(f'Model "{model_name}" already exists. If there are different configurations with the same model name, please use a different model name.')
-        mlx_path = make_model_exist(model_id_or_path=model_path, quant=quant, revision=model_config.revision, adapter_path=adapter_path)
-        mx.metal.clear_cache()
-        self.models[model_name] = model_config
+                 msg = f'More than one model is named as "{model_name}". Please set the "model_name" argument differently for these models.'
+                 self.log(msg, 'error')
+                 ValueError(msg)
+        self._model = None
+        self._cache_manage_config = dict(
+             min_tokens=min_tokens,
+             max_reprocess_tokens=max_reprocess_tokens,
+             replace_threshold=replace_threshold,
+             max_capacity=max_capacity
+        )
+        end = time.perf_counter()
+        self.log(f'All models prepared locally. Time taken: {end - start:.3f}s.')
 
-    def _get_model_info(self, key: str, config: ModelConfig) -> Dict[str, Any]:
+    def log(self, msg: str, level: Literal["error", "warning", "info", "debug"] = "info") -> None:
+        """Logs a message to the logger at the specified level.
+
+        Args:
+            msg (str): The message to log.
+            level (Literal["error", "warning", "info", "debug"], optional): The logging level. Defaults to "info".
+        """
+        levels = dict(
+            error=40,
+            warning=30,
+            info=20,
+            debug=10
+        )
+        if self._logger:
+            self._logger.log(level=levels.get(level), msg=msg)
+
+    @property
+    def model(self) -> Optional["LLMModel"]:
+        return self._model
+    
+    @property
+    def model_dict(self) -> Dict[str, ModelConfig]:
+        return self._model_dict
+    
+    @property
+    def model_info(self) -> List[Dict[str, Optional[Union[str, int, List, Dict[str, Any]]]]]:
+        if not hasattr(self, '_model_info'):
+            self._model_info = [self._get_model_info(k, v) for k, v in self.model_dict.items()]
+        return self._model_info
+    
+    def _get_model_info(self, key: str, config: ModelConfig) -> Dict[str, Optional[Union[str, int, List, Dict[str, Any]]]]:
+        from datetime import datetime as dt
         config = dict(
             id=key, 
             object='model', 
@@ -269,449 +115,855 @@ class ModelEngine:
             permission=[], 
             root='root',
             info=dict(
-                tokenizer_id=config.tokenizer_id_or_path if config.tokenizer_id_or_path else config.model_id_or_path,
-                tokenizer_kwargs=config.tokenizer_config
+                tokenizer_id=config.tokenizer_repo_or_path if config.tokenizer_repo_or_path else config.model_id_or_path,
+                tokenizer_kwargs=config.tokenizer_kwargs
             )
         )
         return config
 
-    def _log(self, msg: str) -> None:
-        if self.logger:
-            self.logger.info(msg)
+    def load_model(self, model_name: str) -> None:
+        import time
 
-    def _switch_model(self, model_name: str) -> None:
-        """Switch the model in ram to the given model.
+        start = time.perf_counter()
+        if model_name not in self._model_dict:
+            error = f'Model "{model_name}" does not exist.'
+            self.log(error, 'error')
+            raise ValueError(error)
+        
+        if self.model and (self.model.model_name == model_name):
+            return
+        
+        elif self.model:
+            self.model.unload()
+            del self._model
+            self._model = None
 
-        Args:
-            model_name (str): Model name of the model.
-        """
-        if model_name not in self.models.keys():
-            raise ValueError(f'No model named "{model_name}".')
-        if model_name != self.current_model:
-            start = time.perf_counter()
-            del self.model, self.tokenizer, self.cache_manager, self.outlines_tokenizer
-            mx.metal.clear_cache()
-            model_args = self.models[model_name]._asdict()
-            model_args.pop('model_name')
-            self.model, self.tokenizer = get_model_and_tokenizer(**model_args)
-            self.current_model = model_name
-            model_key = get_model_name(self.models[model_name].model_id_or_path)
-            self.cache_manager = CacheManager(
-                cache_dir=os.path.join(self.cache_dir, model_key),
-                token_threshold=self.token_threshold,
-                save_similarity_threshold=self.save_sim_threshold,
-                max_keep=self.max_keep,
-                logger=self.logger
-                )
-            self.chat_template = ChatTemplate(tokenizer=self.tokenizer._tokenizer)
-            if OUTLINE_INSTALLED:
-                self.outlines_tokenizer = TransformerTokenizer(tokenizer=self.tokenizer._tokenizer)
-            end = time.perf_counter()
-            self._log(f'Switch to model "{model_name}"; time taken: {end - start:.4f}s')
-
-    def _get_outlines_processor(self,
-            guided_json: Optional[Union[str, dict]] = None,
-            guided_choice: Optional[List[str]] = None,
-            guided_regex: Optional[str] = None,
-            guided_grammar: Optional[str] = None,
-            guided_whitespace_pattern: Optional[str] = None
-            ) -> Optional[OutlinesLogitsProcessor]:
-        logits_processor = None
-        if OUTLINE_INSTALLED and (guided_choice) is not None:
-            logits_processor=get_choice_processor(guided_choice, self.outlines_tokenizer)
-
-        elif OUTLINE_INSTALLED and (guided_json) is not None:
-            logits_processor=get_json_processor(guided_json, self.outlines_tokenizer, guided_whitespace_pattern)
-
-        elif OUTLINE_INSTALLED and (guided_regex) is not None:
-            logits_processor=get_regex_processor(guided_regex, self.outlines_tokenizer)
-            
-        elif OUTLINE_INSTALLED and (guided_grammar) is not None:
-            logits_processor = get_grammar_processor(guided_grammar, self.outlines_tokenizer)
-
-        return logits_processor
+        from .model_utils import LLMModel
+        mc = self.model_dict[model_name]
+        self._model = LLMModel(
+            model_id_or_path=mc.model_id_or_path,
+            tokenizer_repo_or_path=mc.tokenizer_repo_or_path,
+            model_kwargs=mc.model_kwargs,
+            tokenizer_kwargs=mc.tokenizer_kwargs,
+            model_name=mc.model_name,
+            logger=self._logger,
+            enable_cache=mc.enable_cache,
+            cache_manage_config=self._cache_manage_config,
+            preprocess_batch_size=mc.preprocess_batch_size,
+            extra_stop_words=mc.extra_stop_words,
+            reasoning_parser=mc.reasoning_parser,
+            default_template=mc.default_template
+        )
+        end = time.perf_counter()
+        self.log(f'Model "{model_name}" loaded. Time taken: {end - start:.3f}s.')
 
     def generate(self,
             model: str,
             prompt: Union[str, List[str]],
-            completion_type: Literal['text_completion', 'chat.completion'] = 'text_completion', 
+            images: Optional[List[Optional[List[str]]]] = None,
+            logit_bias: Optional[Dict[str, int]] = None,
+            logprobs: Optional[int] = None,
             stream: bool = False,
-            stop: Optional[List[str]] = None,
-            max_tokens: int = 4096,
             n: int = 1,
-            temperature: float = 0,
-            repetition_penalty: Optional[float] = None,
-            repetition_context_size: Optional[int] = 100,
+            max_tokens: int = 4096,
+            stop: Optional[List[str]] = None,
+            seed: Optional[int] = None,
+            presence_penalty: float = 0.0,
+            frequency_penalty: float = 0.0,
+            repetition_penalty: float = 1.0,
+            penalty_context_size: Optional[int] = 1000,
+            temperature: float = 0.0,
+            top_k: Optional[int] = None,
             top_p: float = 1.0,
             min_p: float = 0.0,
             min_tokens_to_keep: int = 1,
-            logit_bias: Optional[Dict[int, float]] = None,
-            seed: Optional[int] = None,
-            guided_json: Optional[Union[str, dict]] = None,
+            guided_json: Optional[Dict[str, Any]] = None,
             guided_choice: Optional[List[str]] = None,
             guided_regex: Optional[str] = None,
             guided_grammar: Optional[str] = None,
-            guided_whitespace_pattern: Optional[str] = None,
-            # chat specific arguments
-            tools: Optional[List[Dict[str, Any]]] = None,
-            tool_choice: Union[Literal['none','auto', 'required'], Dict[str, Union[str, Dict[str, str]]]] = 'auto',
+            whitespace_pattern: Optional[str] = None,
             **kwargs
-        ) -> Union[List[GenerationOutput], Iterator[GenerationOutput]]:
-        """Generate text with a model.
-
-        Args:
-            model_name (str): Name of the model to use.
-            prompt (str): Text prompt for the generation.
-            stream (bool, optional): Whether to return a generator for streaming text tokens during generation. Defaults to False.
-            stop (Optional[List[str]], optional): List of texts to stop generation. Defaults to None.
-            max_tokens (int, optional): Maximum number of tokens to generate. Defaults to 256.
-            temperature (float, optional): Temperature that decide the "randomness" of the generation. Defaults to 0.
-            repetition_penalty (Optional[float], optional): Penalty for repeated textt during generation. 1.0 being no penalty while higher values gives more penalty. Defaults to None.
-            repetition_context_size (Optional[int], optional): Size of previous tokens to consider for repetition penalty. Defaults to 100.
-            top_p (float, optional): Top P sampling. Defaults to 1.0.
-            min_p (float, optional): Min P sampling. Defaults to 0.0.
-            min_tokens_to_keep (int, optional): Minimum number of tokens to keep for sampling. Defaults to 1.
-            logit_bias (Optional[Dict[int, float]], optional): Logits bias. Defaults to None.
-            prefill_step_size (Optional[int], optional): Batch size for prompt preprocessing. Defaults to None.
-
-        Returns:
-            Union[str, Iterator[str]]: Generated text if `stream=False`.
-
-        Yields:
-            Iterator[Union[str, Iterator[str]]]: Generator of generated text if `stream=True`.
-        """
-        self._switch_model(model_name=model)
-        prompts = [prompt] if isinstance(prompt, str) else prompt
-        prompt_tokens = [remove_bos_duplicates(self.tokenizer.encode(p), bos_token_id=self.tokenizer.bos_token_id) for p in prompts]
-        if n != 1:
-            prompt_tokens = sum([[p] * n  for p in prompt_tokens], [])
-            prompts = sum([[p] * n  for p in prompts], [])
-        num_prompts = len(prompts)
-        prompt_index = list(range(num_prompts))
-        cache_history, cache_ids = self.cache_manager.find_cache(token_ids=prompt_tokens)
-        cache_history = CacheHistory(cache=make_empty_cache(model=self.model), token_ids=[]) if cache_history is None else cache_history
-
-        stop = [stop] if isinstance(stop, str) else stop
-        
-        logits_processor = self._get_outlines_processor(guided_json=guided_json, 
-            guided_choice=guided_choice, guided_regex=guided_regex, guided_grammar=guided_grammar, guided_whitespace_pattern=guided_whitespace_pattern)
-        
-        # Handling tool calls
-        tool_stage = None
-        tool_name = None
-        if tools:
-            if tool_choice == 'auto':
-                if isinstance(stop, list):
-                    stop.append(self.chat_template.tool_start)
-                else:
-                    stop = [self.chat_template.tool_start]
-            elif tool_choice == 'required':
-                tool_stage = 'pick_tool'
-                tool_names = [get_tool_name(tool) for tool in tools if get_tool_name(tool) is not None]
-                logits_processor = self._get_outlines_processor(guided_choice=tool_names)
-            elif tool_choice == 'none':
-                pass
-            else:
-                tool_stage = 'gen_args'
-                tool_name = tool_choice['function']['name']
-                tool_dict = list(filter(lambda x: get_tool_name(x) == tool_name, tools))[0]
-                logits_processor = self._get_outlines_processor(guided_json=convert_tool_to_json_schema(tool_dict))
-
-        mx.metal.clear_cache()
-        
-        gen_kwargs = dict(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            prompt=prompts,
-            max_tokens=max_tokens,
-            stop=stop,
+        ) -> Union["TextCompletionOutput", Iterator["TextCompletionOutput"]]:
+        from .sampling_utils import SamplingParams
+        from datetime import datetime as dt
+        import uuid
+        from .generation_utils import TextCompletionOutput, to_completion_logprobs
+        self.load_model(model)
+        params = SamplingParams(
             temperature=temperature,
+            top_k=top_k,
             top_p=top_p,
             min_p=min_p,
+            stop=stop if stop else [],
+            max_completion_tokens=max_tokens,
+            max_reasoning_tokens=0,
             min_tokens_to_keep=min_tokens_to_keep,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
-            repetition_context_size=repetition_context_size,
-            cache_history=cache_history,
-            prefill_batch_size=self.prefill_step_size,
-            logit_bias=logit_bias,
-            seed=seed,
-            logits_processor=logits_processor,
-            verbose=self.verbose,
-            logger=self.logger
-        )
-        cpl_id = uuid.uuid4().hex
-        created = int(dt.now().timestamp())
-        if stream:
-            # Streaming without tool call
-            def stream_output() -> Generator[GenerationOutput, None, None]:
-                nonlocal cache_history
-                try:
-                    stopped = []
-                    is_completed = False
-                    for go in stream_generate(**gen_kwargs):
-                        return_dict = get_return_dict(generation_outputs=go, 
-                                id=cpl_id, 
-                                model=model, 
-                                completion_type=completion_type, 
-                                created=created, 
-                                stream=stream,
-                                indices=prompt_index,
-                                tool_start=self.chat_template.tool_start
-                            )
-                        for g in return_dict:
-                            index = g['choices'][0]['index']
-                            finish_reason = g['choices'][0]['finish_reason']
-                            if finish_reason in ['stop', 'tool_call_start', 'tool_calls']:
-                                stopped.append(index)
-                            if (index not in stopped) or (finish_reason in ['stop', 'tool_call_start', 'tool_calls']):
-                                if finish_reason not in ['stop', 'length']:
-                                    g['choices'][0]['finish_reason'] = None
-                                yield g
-                    is_completed = True
-                finally:
-                    # To avoid weird behavior if the competion is not completed
-                    if is_completed:
-                        token_ids = [g.token_ids.tolist() for g in go]
-                        new_ch = CacheHistory(cache=cache_history.cache, token_ids=token_ids)
-                        self.cache_manager.save_cache(cache=new_ch)
-                        del cache_history, new_ch
-                    mx.metal.clear_cache()
-            
-            # Streaming with tool call
-            def tool_stream_output():
-                if num_prompts != 1:
-                    raise Exception(f'Tool calling for more than one chain of messages is not supported.')
-                if completion_type != 'chat.completion':
-                    raise Exception('Tool calling only supported for chat completion.')
-                
-                nonlocal cache_history, tool_stage, tool_name
-                try:
-                    is_completed = False
-                    text = ''
-                    call_id = uuid.uuid4().hex[:8]
-
-                    # Allow generation if tool_choice is 'auto'
-                    if tool_choice == 'auto':
-                        for go in stream_generate(**gen_kwargs):
-                            g = get_return_dict(generation_outputs=go, 
-                                    id=cpl_id, 
-                                    model=model, 
-                                    completion_type=completion_type, 
-                                    created=created, 
-                                    stream=stream,
-                                    indices=prompt_index,
-                                    tool_start=self.chat_template.tool_start
-                                )[0]
-                            index = g['choices'][0]['index']
-                            finish_reason = g['choices'][0]['finish_reason']
-                            if finish_reason is None or (finish_reason in ('stop', 'length')):
-                                text += g['choices'][0]['delta']['content']
-                                yield g
-                            elif finish_reason == 'tool_call_start':
-                                tool_stage = 'pick_tool'
-                                g['choices'][0]['finish_reason'] = None
-                                # update the generation kwargs here
-                                gen_kwargs['prompt'][0] += text + self.chat_template.tool_start + '{"name": "'
-                                token_ids=[go[0].token_ids.tolist()]
-                                self.cache_manager.save_cache(cache=CacheHistory(cache=cache_history.cache, token_ids=token_ids))
-                                mx.metal.clear_cache()
-                                cache_history, cache_ids = self.cache_manager.find_cache([
-                                    remove_bos_duplicates(self.tokenizer.encode(gen_kwargs['prompt'][0]), bos_token_id=self.tokenizer.bos_token_id)
-                                ])
-                                cache_history = CacheHistory(cache=make_empty_cache(model=self.model), token_ids=[]) if cache_history is None else cache_history
-                                gen_kwargs['cache_history'] = cache_history
-                                tool_names = [get_tool_name(tool) for tool in tools if get_tool_name(tool) is not None]
-                                gen_kwargs['logits_processor'] = self._get_outlines_processor(guided_choice=tool_names)
-                                yield g
-
-                    # stage 2, generate tool name
-                    if tool_stage == 'pick_tool':
-                        go = generate(**gen_kwargs)
-                        finish_reason = go[0].finish_reason
-                        tool_name = go[0].text
-                        if finish_reason == 'stop':
-                            tool_stage = 'gen_args'
-                            gen_kwargs['prompt'][0] += tool_name + '", arguments": '
-                            token_ids=[go[0].token_ids.tolist()]
-                            self.cache_manager.save_cache(cache=CacheHistory(cache=cache_history.cache, token_ids=token_ids))
-                            mx.metal.clear_cache()
-                            # Find cache again
-                            cache_history, cache_ids = self.cache_manager.find_cache([
-                                remove_bos_duplicates(self.tokenizer.encode(gen_kwargs['prompt'][0]), bos_token_id=self.tokenizer.bos_token_id)
-                            ])
-                            cache_history = CacheHistory(cache=make_empty_cache(model=self.model), token_ids=[]) if cache_history is None else cache_history
-                            gen_kwargs['cache_history'] = cache_history
-                            tool_dict = list(filter(lambda x: get_tool_name(x) == tool_name, tools))[0]
-                            gen_kwargs['logits_processor'] = self._get_outlines_processor(guided_json=convert_tool_to_json_schema(tool_dict))
-
-                    # stage 3, generate arugments
-                    if tool_stage == 'gen_args':
-                        go = generate(**gen_kwargs)
-                        finish_reason = go[0].finish_reason
-                        tool_arguments = go[0].text
-                        return_dict = get_return_dict(
-                            generation_outputs=go,
-                            id=cpl_id, 
-                            model=model, 
-                            completion_type=completion_type, 
-                            created=created, 
-                            stream=stream,
-                            indices=prompt_index,
-                            tool_start=self.chat_template.tool_start,
-                            tool_call_id=call_id,
-                            tool_name=tool_name,
-                            tool_arguments=tool_arguments
-                        )
-                        yield return_dict[0]
-                    is_completed = True
-
-                finally:
-                    # To avoid weird behavior if the competion is not completed
-                    if is_completed:
-                        token_ids = [g.token_ids.tolist() for g in go]
-                        new_ch = CacheHistory(cache=cache_history.cache, token_ids=token_ids)
-                        self.cache_manager.save_cache(cache=new_ch)
-                        del cache_history, new_ch
-                    mx.metal.clear_cache()
-
-            return stream_output() if not tools or tool_choice == 'none' else tool_stream_output()
-
-        else:
-            call_id = uuid.uuid4().hex[:8]
-            tool_name = None
-            tool_arguments = None
-            if not tools or tool_choice in ['none', 'auto']:
-                go = generate(**gen_kwargs)
-                token_ids = [g.token_ids.tolist() for g in go]
-                text = go[0].text
-                finish_reason = go[0].finish_reason
-                if (finish_reason == 'stop') and (go[0].stop_text == self.chat_template.tool_start):
-                    tool_stage = 'pick_tool'
-                    # update the generation kwargs here
-                    gen_kwargs['prompt'][0] += text + self.chat_template.tool_start + '{"name": "'
-                    token_ids=[go[0].token_ids.tolist()]
-                    self.cache_manager.save_cache(cache=CacheHistory(cache=cache_history.cache, token_ids=token_ids))
-                    mx.metal.clear_cache()
-                    cache_history, cache_ids = self.cache_manager.find_cache([
-                        remove_bos_duplicates(self.tokenizer.encode(gen_kwargs['prompt'][0]), bos_token_id=self.tokenizer.bos_token_id)
-                    ])
-                    cache_history = CacheHistory(cache=make_empty_cache(model=self.model), token_ids=[]) if cache_history is None else cache_history
-                    gen_kwargs['cache_history'] = cache_history
-                    tool_names = [get_tool_name(tool) for tool in tools if get_tool_name(tool) is not None]
-                    gen_kwargs['logits_processor'] = self._get_outlines_processor(guided_choice=tool_names)
-                else:
-                    call_id = None
-
-            # stage 2, generate tool name
-            if tool_stage == 'pick_tool':
-                go = generate(**gen_kwargs)
-                finish_reason = go[0].finish_reason
-                tool_name = go[0].text
-                if finish_reason == 'stop':
-                    tool_stage = 'gen_args'
-                    gen_kwargs['prompt'][0] += tool_name + '", arguments": '
-                    token_ids=[go[0].token_ids.tolist()]
-                    self.cache_manager.save_cache(cache=CacheHistory(cache=cache_history.cache, token_ids=token_ids))
-                    mx.metal.clear_cache()
-                    # Find cache again
-                    cache_history, cache_ids = self.cache_manager.find_cache([
-                        remove_bos_duplicates(self.tokenizer.encode(gen_kwargs['prompt'][0]), bos_token_id=self.tokenizer.bos_token_id)
-                    ])
-                    cache_history = CacheHistory(cache=make_empty_cache(model=self.model), token_ids=[]) if cache_history is None else cache_history
-                    gen_kwargs['cache_history'] = cache_history
-                    tool_dict = list(filter(lambda x: get_tool_name(x) == tool_name, tools))[0]
-                    gen_kwargs['logits_processor'] = self._get_outlines_processor(guided_json=convert_tool_to_json_schema(tool_dict))
-
-            # stage 3, generate arugments
-            if tool_stage == 'gen_args':
-                go = generate(**gen_kwargs)
-                finish_reason = go[0].finish_reason
-                tool_arguments = go[0].text
-
-            token_ids=[go[0].token_ids.tolist()]
-            self.cache_manager.save_cache(cache=CacheHistory(cache=cache_history.cache, token_ids=token_ids))
-            del cache_history
-            mx.metal.clear_cache()
-
-            return get_return_dict(go, id=cpl_id, model=model, 
-                completion_type=completion_type, created=created, stream=False, 
-                tool_start=self.chat_template.tool_start, tool_call_id=call_id, tool_name=tool_name, tool_arguments=tool_arguments)
-        
-    def chat_generate(self,
-            model: str,
-            messages: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],
-            stream: bool = False,
-            stop: Optional[List[str]] = None,
-            max_tokens: int = 4096,
-            n: int = 1,
-            temperature: float = 0,
-            repetition_penalty: Optional[float] = None,
-            repetition_context_size: Optional[int] = 100,
-            top_p: float = 1.0,
-            min_p: float = 0.0,
-            min_tokens_to_keep: int = 1,
-            logit_bias: Optional[Dict[int, float]] = None,
-            seed: Optional[int] = None,
-            guided_json: Optional[Union[str, dict]] = None,
-            guided_choice: Optional[List[str]] = None,
-            guided_regex: Optional[str] = None,
-            guided_grammar: Optional[str] = None,
-            guided_whitespace_pattern: Optional[str] = None,
-            tools: Optional[List[Dict[str, Any]]] = None,
-            tool_choice: Union[Literal['none', 'auto', 'required'], Dict[str, Union[str, Dict[str, str]]]] = 'auto',
-            **kwargs
-        ) -> Union[List[GenerationOutput], Iterator[GenerationOutput]]:
-        """Generate text with a model.
-
-        Args:
-            model_name (str): Name of the model to use.
-            prompt (str): Text prompt for the generation.
-            stream (bool, optional): Whether to return a generator for streaming text tokens during generation. Defaults to False.
-            stop (Optional[List[str]], optional): List of texts to stop generation. Defaults to None.
-            max_tokens (int, optional): Maximum number of tokens to generate. Defaults to 256.
-            temperature (float, optional): Temperature that decide the "randomness" of the generation. Defaults to 0.
-            repetition_penalty (Optional[float], optional): Penalty for repeated textt during generation. 1.0 being no penalty while higher values gives more penalty. Defaults to None.
-            repetition_context_size (Optional[int], optional): Size of previous tokens to consider for repetition penalty. Defaults to 100.
-            top_p (float, optional): Top P sampling. Defaults to 1.0.
-            min_p (float, optional): Min P sampling. Defaults to 0.0.
-            min_tokens_to_keep (int, optional): Minimum number of tokens to keep for sampling. Defaults to 1.
-            logit_bias (Optional[Dict[int, float]], optional): Logits bias. Defaults to None.
-            prefill_step_size (Optional[int], optional): Batch size for prompt preprocessing. Defaults to None.
-
-        Returns:
-            Union[str, Iterator[str]]: Generated text if `stream=False`.
-
-        Yields:
-            Iterator[Union[str, Iterator[str]]]: Generator of generated text if `stream=True`.
-        """
-        self._switch_model(model_name=model)
-        if not isinstance(messages[0], list):
-            messages = [messages]
-        prompt = [self.chat_template.apply_chat_template(messages=msgs, tools=tools, tool_choice=tool_choice) for msgs in messages]
-        output = self.generate(
-            model=model,
-            prompt=prompt,
-            completion_type='chat.completion',
-            stream=stream,
-            stop=stop,
-            max_tokens=max_tokens,
-            n=n,
-            temperature=temperature,
-            repetition_penalty=repetition_penalty,
-            repetition_context_size=repetition_context_size,
-            top_p=top_p,
-            min_p=min_p,
-            min_tokens_to_keep=min_tokens_to_keep,
-            logit_bias=logit_bias,
+            penalty_context_size=penalty_context_size,
+            logit_bias={int(k): v for k, v in logit_bias} if logit_bias else None,
             seed=seed,
             guided_json=guided_json,
             guided_choice=guided_choice,
             guided_regex=guided_regex,
             guided_grammar=guided_grammar,
-            guided_whitespace_pattern=guided_whitespace_pattern,
-            tools=tools,
-            tool_choice=tool_choice
+            whitespace_pattern=whitespace_pattern,
+            logprobs=True if logprobs else False,
+            top_logprobs=logprobs if logprobs else 4
         )
-        return output
+        cpl_id = 'cmpl-' + uuid.uuid4().hex
+        created = int(dt.now().timestamp())
+        if stream:
+            def gen_output():
+                output = self.model.stream(prompts=prompt, sampling_params=params, images=images, n=n, is_thinking=False)
+                status = [None] if isinstance(prompt, str) else [None] * len(prompt)
+                prompt_tokens = None
+                completion_tokens = [0] if isinstance(prompt, str) else [0] * len(prompt)
+                for gos in output:
+                    choices = [
+                        dict(
+                            index=go.index,
+                            text=go.token,
+                            finish_reason=go.finish_reason,
+                            logprobs=to_completion_logprobs([go.logprobs]) if params.logprobs and (not s) else None
+                        )
+                    for s, go in zip(status, gos)
+                    ]
+                    if prompt_tokens is None:
+                        prompt_tokens = sum([go.input_tokens for go in gos])
+                    completion_tokens = [go.output_tokens if not s else c for c, s, go in zip(completion_tokens, status, gos)]
+                    status = [go.finish_reason if not s else s for s, go in zip(status, gos)]
+                    cmpl = dict(
+                        id=cpl_id,
+                        created=created,
+                        model=model,
+                        choices=choices
+                    )
+                    yield TextCompletionOutput.model_validate(cmpl)
+                
+                # Usage information
+                completion_tokens = sum(completion_tokens)
+                cmpl = dict(
+                    id=cpl_id,
+                    created=created,
+                    model=model,
+                    choices=[dict(index=go.index, text='') for go in gos],
+                    usage=dict(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=prompt_tokens + completion_tokens)
+                )
+                yield TextCompletionOutput.model_validate(cmpl)
+            return gen_output()
+        
+        else:
+            output = self.model.generate(prompts=prompt, sampling_params=params, images=images, n=n, is_thinking=False)
+            prompt_tokens = sum(output['input_tokens'])
+            completion_tokens = sum(output['output_tokens'])
+            usage = dict(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens
+            )
+            logprobs = output['logprobs'] if output['logprobs'] else range(len(output['indices']))
+            cmpl = dict(
+                id=cpl_id,
+                created=created,
+                model=model,
+                choices=[dict(
+                    index=i,
+                    text=t,
+                    logprobs=to_completion_logprobs(l) if params.logprobs else None,
+                    finish_reason=fr
+                ) for i, t, l, fr in zip(
+                    output['indices'], output['texts'], logprobs, output['finish_reasons']
+                )],
+                usage=usage
+            )
+            return TextCompletionOutput.model_validate(cmpl)
 
-    
+    def chat_generate(self,
+            model: str,
+            messages: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],
+            logit_bias: Optional[Dict[str, int]] = None,
+            logprobs: bool = False,
+            top_logprobs: int = 4,
+            stream: bool = False,
+            n: int = 1,
+            max_completion_tokens: int = 4096,
+            reasoning_effort: Optional[Literal['low', 'medium', 'high']] = None,
+            max_reasoning_tokens: Optional[int] = None,
+            stop: Optional[List[str]] = None,
+            response_format: Optional[Dict[str, Any]] = None,
+            tools: Optional[List[Dict[str, Any]]] = None,
+            tool_choice: Union[Literal['auto', 'required', 'none'], Dict[str, Any]] = 'auto',
+            seed: Optional[int] = None,
+            presence_penalty: float = 0.0,
+            frequency_penalty: float = 0.0,
+            repetition_penalty: float = 1.0,
+            penalty_context_size: Optional[int] = 1000,
+            temperature: float = 0.0,
+            top_k: Optional[int] = None,
+            top_p: float = 1.0,
+            min_p: float = 0.0,
+            min_tokens_to_keep: int = 1,
+            guided_json: Optional[Dict[str, Any]] = None,
+            guided_choice: Optional[List[str]] = None,
+            guided_regex: Optional[str] = None,
+            guided_grammar: Optional[str] = None,
+            whitespace_pattern: Optional[str] = None,
+            use_reasoning_content: Optional[bool] = None,
+            **kwargs
+        ) -> Union["ChatCompletionOutput", Iterator["ChatCompletionOutput"]]:
+        from .chat_utils import OpenAIToolSchema, build_function_call_schema, convert_tool_to_json_schema, ToolChoiceSchema, ResponseFormat
+        from datetime import datetime as dt
+        import uuid
+        import json
+        from .sampling_utils import SamplingParams
+        from .generation_utils import ChatCompletionOutput
+        if (not tools) and (tool_choice == 'auto'):
+            _tool_choice = 'none'
+            _tools = None
+        else:
+            _tool_choice = tool_choice
+            _tools = tools if (_tool_choice in ('auto', 'required')) or (isinstance(_tool_choice, dict)) else None
+            if isinstance(_tool_choice, dict):
+                ToolChoiceSchema.model_validate(_tool_choice)
+
+        if _tools:
+            [OpenAIToolSchema.model_validate(t) for t in _tools]
+        elif (_tool_choice == 'required') or isinstance(_tool_choice, dict):
+            error = 'Required function calling, but no tools are provided.'
+            self.log(error, 'error')
+            raise ValueError(error)
+
+        if guided_json and response_format:
+            error = 'Either use "response_format" or "guided_json", but not both.'
+            self.log(error, 'error')
+            raise ValueError(error)
+        
+        _guided_json = ResponseFormat.model_validate(response_format).json_schema if response_format else guided_json
+
+        if ((_tool_choice == 'required') or isinstance(_tool_choice, dict)) and _guided_json:
+            error = 'Cannot use json schema alongside with tool calling.'
+            self.log(error, 'error')
+            raise ValueError(error)
+        
+        if _tool_choice == 'required':
+            _guided_json = build_function_call_schema(_tools)
+        elif isinstance(_tool_choice, dict):
+            tool_name = _tool_choice['function']['name']
+            tool_schemas = [t for t in _tools if t['function']['name'] == tool_name]
+            if len(tool_schemas) == 0:
+                error = f'Provided tool choice "{tool_name}" not in given list of tools.'
+                self.log(error, 'error')
+                raise ValueError(error)
+            _guided_json = build_function_call_schema(tool_schemas)
+
+        self.load_model(model)
+
+        if self.model.chat_template.reasoning_start:
+            rmap = dict(low=512, medium=2048, high=4096)
+            if max_reasoning_tokens is not None:
+                _max_reasoning_tokens = max_reasoning_tokens
+            elif reasoning_effort:
+                _max_reasoning_tokens = rmap(reasoning_effort)
+            else:
+                _max_reasoning_tokens = rmap['medium']
+
+        elif max_reasoning_tokens or reasoning_effort:
+            _max_reasoning_tokens = 0
+            self.log(f'Model "{self.model.model_name}" is not configured to support reasoning. Setting max_reasoning_tokens to 0.')
+
+        else:
+            _max_reasoning_tokens = 0
+
+        use_reasoning_content = self._use_reasoning_content if use_reasoning_content is None else use_reasoning_content
+
+        if _max_reasoning_tokens:
+            tparams = SamplingParams(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                stop=[self.model.chat_template.reasoning_end.rstrip()],
+                max_completion_tokens=max_completion_tokens,
+                max_reasoning_tokens=_max_reasoning_tokens,
+                min_tokens_to_keep=min_tokens_to_keep,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                repetition_penalty=repetition_penalty,
+                penalty_context_size=penalty_context_size,
+                logit_bias={int(k): v for k, v in logit_bias} if logit_bias else None,
+                seed=seed,
+                guided_json=None,
+                guided_choice=None,
+                guided_regex=None,
+                guided_grammar=None,
+                whitespace_pattern=whitespace_pattern,
+                logprobs=logprobs,
+                top_logprobs=top_logprobs
+            )
+        else:
+            tparams = None
+
+        stop_str = stop if stop else []
+        if _tool_choice == 'auto' and (self.model.chat_template.tool_start not in stop_str):
+            stop_str.append(self.model.chat_template.tool_start)
+        params = SamplingParams(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            stop=stop_str,
+            max_completion_tokens=max_completion_tokens,
+            max_reasoning_tokens=_max_reasoning_tokens,
+            min_tokens_to_keep=min_tokens_to_keep,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            repetition_penalty=repetition_penalty,
+            penalty_context_size=penalty_context_size,
+            logit_bias={int(k): v for k, v in logit_bias} if logit_bias else None,
+            seed=seed,
+            guided_json=_guided_json,
+            guided_choice=guided_choice,
+            guided_regex=guided_regex,
+            guided_grammar=guided_grammar,
+            whitespace_pattern=whitespace_pattern,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs
+        )
+
+        cpl_id = 'chatcmpl-' + uuid.uuid4().hex
+        created = int(dt.now().timestamp())
+
+        if len(messages) == 0:
+            error = 'No message sequences provided.'
+            self.log(error, 'error')
+            raise ValueError(error)
+        
+        if self.model.is_vision and _max_reasoning_tokens and (n > 1):
+            error = 'Vsion model cannot have `n` > 2 when reasoning is enabled.'
+            self.log(error, 'error')
+            raise ValueError(error)
+        
+        
+        msgs = [messages] if isinstance(messages[0], dict) else msgs
+        for m in msgs:
+            if len(m) == 0:
+                error = 'Cannot have empty messages sequences.'
+                self.log(error, 'error')
+                raise ValueError(error)
+                        
+        if tparams:
+            pi_pairs = [
+                self.model.chat_template.apply_chat_template(m, tools=_tools, reasoning=True)
+                for m in msgs
+            ]
+        else:
+            pi_pairs = [
+                self.model.chat_template.apply_chat_template(m, tools=_tools, tool_choice=_tool_choice, reasoning=False)
+                for m in msgs
+            ]
+
+        prompts = [pp[0] for pp in pi_pairs]
+        images = [pp[1] for pp in pi_pairs]
+
+        if stream:
+            def gen_tokens():
+                nonlocal prompts, images, tparams, params, n, cpl_id, created
+                object='chat.completion.chunk'
+                indices = list(range(len(prompts) * n))
+                prompt_tokens = None
+                reasoning_tokens = [0] * len(indices)
+                completion_tokens = [0] * len(indices)
+                cmpls = [dict(
+                    id=cpl_id,
+                    object=object,
+                    created=created,
+                    model=model,
+                    choices = [dict(index=i, delta=dict(role='assistant', content=''))]
+                ) for i in indices]
+                for c in cmpls:
+                    yield ChatCompletionOutput.model_validate(c)
+                if tparams:
+                    gen_outputs = [''] * len(indices)
+                    status = [None] * len(indices)
+                    toutput = self.model.stream(prompts=prompts, sampling_params=tparams, images=images, n=n, is_thinking=True)
+                    prefs = [self.model.chat_template.reasoning_start if not use_reasoning_content else ''] * len(indices)
+                    tend = self.model.chat_template.reasoning_end if self.model.chat_template.reasoning_end else ''
+                    for gos in toutput:
+                        gen_outputs = [t + go.token if not s else t for s, t, go in zip(status, gen_outputs, gos)]
+                        cmpls = [dict(
+                            id=cpl_id,
+                            object=object,
+                            created=created,
+                            model=model,
+                            choices = [dict(
+                                index=go.index, 
+                                delta=dict(
+                                    content='',
+                                    reasoning_content=p + go.token if not s else None
+                                    ) if use_reasoning_content else dict(
+                                        content=(p + go.token + tend if go.finish_reason else p + go.token) if not s else None),
+                                finish_reason=None,
+                                logprobs=dict(content=[go.logprobs]) if tparams.logprobs and (not s) else None
+                            )]
+                        ) for s, go, p in zip(status, gos, prefs)]
+                        prefs = ['' if go.token is not None else p for p, go in zip(prefs, gos)]
+                        if prompt_tokens is None:
+                            prompt_tokens = [go.input_tokens for go in gos]
+                        reasoning_tokens = [go.output_tokens if s else rt for s, go, rt in zip(status, gos, reasoning_tokens)]
+                        status = [go.finish_reason if not s else s for s, go in zip(status, gos)]
+
+                        for cmpl in cmpls:
+                            if cmpl['choices'][0]['delta']['reasoning_content' if use_reasoning_content else 'content'] is not None:
+                                yield ChatCompletionOutput.model_validate(cmpl)
+
+                    new_prompts = []
+                    new_images = []
+                    for prompt in prompts:
+                        new_prompts.extend([prompt] * n)
+                    for img in images:
+                        new_images.extend([img] * n)
+                    new_prompts = [p + gt + self.model.chat_template.reasoning_end for p, gt in zip(new_prompts, gen_outputs)]
+                    prompts = new_prompts
+                    images = new_images
+
+                    if (_tool_choice == 'required') or (isinstance(_tool_choice, dict)):
+                        prompts = [p + self.model.chat_template.tool_start for p in prompts]
+                        is_tool_call = True
+                    else:
+                        is_tool_call = False
+
+                    output = self.model.stream(prompts=prompts, sampling_params=params, images=images, n=1, is_thinking=False)
+
+                else:
+                    is_tool_call = (_tool_choice == 'required') or (isinstance(_tool_choice, dict))
+                    output = self.model.stream(prompts=prompts, sampling_params=params, images=images, n=n, is_thinking=False)
+
+                # Definite tool calls
+                if is_tool_call:
+                    tool_call_strs = [''] * len(indices)
+                    call_ids = ['call_' + uuid.uuid4().hex[:8] for i in range(len(indices))]
+                    status = [None] * len(indices)
+                    logprob_list = [[]] * len(indices)
+                    for gos in output:
+                        tool_call_strs = [tcs + go.token for tcs, go in zip(tool_call_strs, gos)]
+                        if prompt_tokens is None:
+                            prompt_tokens = [go.input_tokens for go in gos]
+                        completion_tokens = [go.output_tokens if not s else c for s, go, c in zip(status, gos, completion_tokens)]
+                        if params.logprobs:
+                            logprob_list = [lp + [go.logprobs] if not s else lp for s, go, lp in zip(status, gos, logprob_list)]
+                        status = [s if s else go.finish_reason for s, go in zip(status, gos)]
+
+                    tool_call_list = [json.loads(tcs) for tcs in tool_call_strs]
+                    cmpls = [dict(
+                        id=cpl_id,
+                        object=object,
+                        created=created,
+                        model=model,
+                        choices=[
+                            dict(
+                                index=go.index,
+                                logprobs=dict(content=lp) if params.logprobs else None,
+                                delta=dict(
+                                    tool_calls=[dict(index=0, id=cid, function=dict(name=tc['name'], arguments=json.dumps(tc['arguments'])))]
+                                )
+                            )
+                        ]
+                    ) for go, cid, tc, lp in zip(gos, call_ids, tool_call_list, logprob_list)]
+                    for cmpl in cmpls:
+                        yield ChatCompletionOutput.model_validate(cmpl)
+
+                    cmpls = [dict(
+                        id=cpl_id,
+                        object=object,
+                        created=created,
+                        model=model,
+                        choices=[
+                            dict(index=go.index, delta=dict(), finish_reason='tool_calls')
+                        ],
+                        usage=dict(prompt_tokens=pt, completion_tokens=ct + rt, total_tokens=pt + ct + rt, completion_tokens_details=dict(reasoning_tokens=rt))
+                    ) for go, pt, rt, ct in zip(gos, prompt_tokens, reasoning_tokens, completion_tokens)]
+                    for cmpl in cmpls:
+                        yield ChatCompletionOutput.model_validate(cmpl)
+
+                # Any other form of generation except 'auto'
+                elif _tool_choice == 'none':
+                    status = [None] * len(indices)
+                    for gos in output:
+                        cmpls = [dict(
+                            id=cpl_id,
+                            object=object,
+                            created=created,
+                            model=model,
+                            choices=[
+                                dict(
+                                    index=go.index,
+                                    logprobs=dict(content=[go.logprobs]) if params.logprobs else None,
+                                    delta=dict(
+                                        content=go.token if go.token and (not s) else None
+                                    )
+                                )
+                            ]
+                        ) for go, s in zip(gos, status)]
+                        if prompt_tokens is None:
+                            prompt_tokens = [go.input_tokens for go in gos]
+                        completion_tokens = [go.output_tokens if not s else c for s, go, c in zip(status, gos, completion_tokens)]
+                        status = [s if s else go.finish_reason for s, go in zip(status, gos)]
+                        for cmpl in cmpls:
+                            if cmpl['choices'][0]['delta']['content'] is not None:
+                                yield ChatCompletionOutput.model_validate(cmpl)
+
+                        # Yield ended sequences as well
+                        cmpls = [dict(
+                            id=cpl_id,
+                            object=object,
+                            created=created,
+                            model=model,
+                            choices=[
+                                dict(
+                                    index=go.index,
+                                    delta=dict(),
+                                    finish_reason=go.finish_reason
+                                )
+                            ],
+                            usage=dict(prompt_tokens=pt, completion_tokens=ct + rt, total_tokens=pt + ct + rt, completion_tokens_details=dict(reasoning_tokens=rt))
+                        ) for go, ct, rt, pt in zip(gos, completion_tokens, reasoning_tokens, prompt_tokens) if go.finish_reason]
+                        for cmpl in cmpls:
+                            yield ChatCompletionOutput.model_validate(cmpl)
+
+                # Deal with tool_choice="auto" case
+                else:
+                    status = [None] * len(indices)
+                    if len(prompts) != len(indices):
+                        new_prompts = []
+                        new_images = []
+                        for p, img in zip(prompts, images):
+                            new_prompts.extend([p] * n)
+                            new_images.extend([img] * n)
+                        prompts = new_prompts
+                        images = new_images
+
+                    for gos in output:
+                        cmpls = [dict(
+                            id=cpl_id,
+                            object=object,
+                            created=created,
+                            model=model,
+                            choices=[
+                                dict(
+                                    index=go.index,
+                                    logprobs=dict(content=[go.logprobs]) if params.logprobs else None,
+                                    delta=dict(
+                                        content=go.token if go.token and (not s) else None
+                                    )
+                                )
+                            ]
+                        ) for go, s in zip(gos, status)]
+                        if prompt_tokens is None:
+                            prompt_tokens = [go.input_tokens for go in gos]
+                        completion_tokens = [go.output_tokens if not s else c for s, go, c in zip(status, gos, completion_tokens)]
+                        prompts = [p + go.token if not s else p for s, go, p in zip(status, gos, prompts)]
+                        status = [s if s else (go.finish_reason if go.stop_str != self.model.chat_template.tool_start else 'tool_call_start') for s, go in zip(status, gos)]
+                        for cmpl in cmpls:
+                            if cmpl['choices'][0]['delta']['content'] is not None:
+                                yield ChatCompletionOutput.model_validate(cmpl)
+
+                        # Yield ended sequences as well
+                        cmpls = [dict(
+                            id=cpl_id,
+                            object=object,
+                            created=created,
+                            model=model,
+                            choices=[
+                                dict(
+                                    index=go.index,
+                                    delta=dict(),
+                                    finish_reason=go.finish_reason
+                                )
+                            ],
+                            usage=dict(prompt_tokens=pt, completion_tokens=ct + rt, total_tokens=pt + ct + rt, completion_tokens_details=dict(reasoning_tokens=rt))
+                        ) for go, ct, rt, pt in zip(gos, completion_tokens, reasoning_tokens, prompt_tokens) if (go.finish_reason and (go.stop_str != self.model.chat_template.tool_start))]
+                        for cmpl in cmpls:
+                            yield ChatCompletionOutput.model_validate(cmpl)
+
+                        # Dealing with tool calls for those with tool_call_start
+                        if len([s for s in status if status == 'tool_call_start']) > 0:
+                            # Set guided decoding to tool call schema
+                            params.guided_choice = None
+                            params.guided_regex = None
+                            params.guided_grammar = None
+                            params.guided_json = build_function_call_schema(_tools)
+                            
+                            prompts = [p + self.model.chat_template.tool_start for p, s in zip(prompts, status) if s == 'tool_call_start']
+                            images = [img for img, s in zip(images, status) if s == 'tool_call_start']
+                            indices = [i for i, s in zip(indices, status) if s == 'tool_call_start']
+                            prompt_tokens = [pt for pt, s in zip(prompt_tokens, status) if s == 'tool_call_start']
+                            completion_tokens = [ct for ct, s in zip(completion_tokens, status) if s == 'tool_call_start']
+                            reasoning_tokens = [rt for rt, s in zip(reasoning_tokens, status) if s == 'tool_call_start']
+                            tool_call_strs = [''] * len(indices)
+                            call_ids = ['call_' + uuid.uuid4().hex[:8] for i in range(len(indices))]
+                            logprob_list = [[]] * len(indices)
+                            status = [None] * len(indices)
+                            output = self.model.stream(prompts, params, images, n=1, is_thinking=False)
+
+                            for gos in output:
+                                tool_call_strs = [tcs + go.token for tcs, go in zip(tool_call_strs, gos)]
+                                completion_tokens = [go.output_tokens if not s else c for s, go, c in zip(status, gos, completion_tokens)]
+                                if params.logprobs:
+                                    logprob_list = [lp + [go.logprobs] if not s else lp for s, go, lp in zip(status, gos, logprob_list)]
+                                status = [s if s else go.finish_reason for s, go in zip(status, gos)]
+
+                            tool_call_list = [json.loads(tcs) for tcs in tool_call_strs]
+                            cmpls = [dict(
+                                id=cpl_id,
+                                object=object,
+                                created=created,
+                                model=model,
+                                choices=[
+                                    dict(
+                                        index=i,
+                                        logprobs=dict(content=lp) if params.logprobs else None,
+                                        delta=dict(
+                                            tool_calls=[dict(index=0, id=cid, function=dict(name=tc['name'], arguments=json.dumps(tc['arguments'])))]
+                                        )
+                                    )
+                                ]
+                            ) for cid, tc, lp, i in zip(call_ids, tool_call_list, logprob_list, indices)]
+                            for cmpl in cmpls:
+                                yield ChatCompletionOutput.model_validate(cmpl)
+
+                            cmpls = [dict(
+                                id=cpl_id,
+                                object=object,
+                                created=created,
+                                model=model,
+                                choices=[
+                                    dict(index=i, delta=dict(), finish_reason='tool_calls')
+                                ],
+                                usage=dict(prompt_tokens=pt, completion_tokens=ct, total_tokens=pt + ct + rt)
+                            ) for i, pt, rt, ct in zip(indices, prompt_tokens, reasoning_tokens, completion_tokens)]
+                            for cmpl in cmpls:
+                                yield ChatCompletionOutput.model_validate(cmpl)
+
+            return gen_tokens()
+
+        else:
+            object = 'chat.completion'
+            indices = list(range(len(prompts) * n))
+            cmpls = dict(
+                id=cpl_id,
+                object=object,
+                created=created,
+                model=model,
+                choices = [
+                    dict(
+                        index=i,
+                        message=dict(
+                            role='assistant',
+                            content='',
+                            reasoning_content='',
+                            tool_calls=[]
+                        ),
+                        finish_reason=None,
+                        logprobs=dict(content=[]) if params.logprobs else None
+                    )
+                for i in indices],
+                usage = dict(
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    completion_tokens_details=dict(
+                        reasoning_tokens=0
+                    )
+                )
+            )
+            if tparams:
+                output = self.model.generate(prompts=prompts, images=images, sampling_params=tparams, n=n, is_thinking=True)
+                texts = output['texts']
+                input_tokens = output['input_tokens']
+                output_tokens = output['output_tokens']
+                logprobs = output['logprobs']
+                for i, t in zip(indices, texts):
+                    if use_reasoning_content:
+                        cmpls['choices'][i]['message']['reasoning_content'] = t
+                    else:
+                        cmpls['choices'][i]['message']['content'] = self.model.chat_template.reasoning_start + t + self.model.chat_template.reasoning_end
+                if params.logprobs:
+                    for i, lp in zip(indices, logprobs):
+                        cmpls['choices'][i]['logprobs']['content'].extend(lp)                   
+
+                if cmpls['usage']['prompt_tokens'] == 0:
+                    cmpls['usage']['prompt_tokens']  = sum(input_tokens)
+
+                cmpls['usage']['completion_tokens'] += sum(output_tokens)
+                cmpls['usage']['completion_tokens_details']['reasoning_tokens'] = sum(output_tokens)
+                
+                if n > 1:
+                    new_prompts = []
+                    new_images = []
+                    for p, img in zip(prompts, images):
+                        new_prompts.extend([p] * n)
+                        new_images.extend([img] * n)
+                
+                    prompts = new_prompts
+                    images = new_images
+                
+                prompts = [p + t + self.model.chat_template.reasoning_end for p, t in zip(prompts, texts)]
+
+                if (_tool_choice == 'required') or (isinstance(_tool_choice, dict)):
+                    prompts = [p + self.model.chat_template.tool_start for p in prompts]
+
+                output = self.model.generate(prompts=prompts, images=images, sampling_params=params, n=1, is_thinking=False)
+
+            else:
+                output = self.model.generate(prompts=prompts, images=images, sampling_params=params, n=n, is_thinking=False)
+
+            if (_tool_choice == 'required') or (isinstance(_tool_choice, dict)):
+                texts = output['texts']
+                input_tokens = output['input_tokens']
+                output_tokens = output['output_tokens']
+                logprobs = output['logprobs']
+
+                tool_call_dicts = [json.loads(t) for t in texts]
+                cids = ['call_' + uuid.uuid4().hex[:8] for i in range(len(indices))]
+                tool_calls = [dict(
+                    index=0,
+                    id=cid,
+                    type='function',
+                    function=dict(name=tc['name'], arguments=json.dumps(tc['arguments']))
+                ) for tc, cid in zip(tool_call_dicts, cids)]
+
+                if cmpls['usage']['prompt_tokens'] == 0:
+                    cmpls['usage']['prompt_tokens'] = sum(input_tokens)
+
+                if params.logprobs:
+                    for i, lp in zip(indices, logprobs):
+                        cmpls['choices'][i]['logprobs']['content'].extend(lp)    
+
+                cmpls['usage']['completion_tokens'] += sum(output_tokens)
+
+                cmpls['usage']['total_tokens'] = cmpls['usage']['completion_tokens'] + cmpls['usage']['prompt_tokens']
+
+                for i, tc in zip(indices, tool_calls):
+                    cmpls['choices'][i]['message']['tool_calls'].append(tc)
+                    cmpls['choices'][i]['finish_reason'] = 'tool_calls'
+
+            else:
+                texts = output['texts']
+                input_tokens = output['input_tokens']
+                output_tokens = output['output_tokens']
+                logprobs = output['logprobs']
+                finish_reasons = output['finish_reasons']
+                stop_strs = output['stop_strs']
+                is_auto = _tool_choice == 'auto'
+
+                finish_reasons = ['tool_calls' if ((ss == self.model.chat_template.tool_start) and is_auto) else fr for fr, ss in zip(finish_reasons, stop_strs)]
+
+                if cmpls['usage']['prompt_tokens'] == 0:
+                    cmpls['usage']['prompt_tokens'] = sum(input_tokens)
+
+                if params.logprobs:
+                    for i, lp in zip(indices, logprobs):
+                        cmpls['choices'][i]['logprobs']['content'].extend(lp)    
+
+                cmpls['usage']['completion_tokens'] += sum(output_tokens)
+
+                cmpls['usage']['total_tokens'] = cmpls['usage']['completion_tokens'] + cmpls['usage']['prompt_tokens']
+
+                for i, t, fr in zip(indices, texts, finish_reasons):
+                    cmpls['choices'][i]['message']['content'] += t
+                    cmpls['choices'][i]['finish_reason'] = fr
+
+                if len([fr for fr in finish_reasons if fr == 'tool_calls']) > 0:
+                    if (n > 1) and (len(prompts) != len(indices)):
+                        new_prompts = []
+                        new_images = []
+                        for p, img in zip(prompts, images):
+                            new_prompts.extend([p] * n)
+                            new_images.extend([img] * n)
+                    
+                        prompts = new_prompts
+                        images = new_images
+
+                    indices = [i for i, fr in zip(indices, finish_reasons) if fr == 'tool_calls']
+                    prompts = [p + t + self.model.chat_template.tool_start  for p, fr, t in zip(prompts, finish_reasons, texts) if fr == 'tool_calls']
+                    images = [img for img, fr in zip(images, finish_reasons) if fr == 'tool_calls']
+
+                    params.guided_choice = None
+                    params.guided_regex = None
+                    params.guided_grammar = None
+                    params.guided_json = build_function_call_schema(_tools)
+                    
+                    output = self.model.generate(prompts, params, images, n=1, is_thinking=False)
+
+                    texts = output['texts']
+                    input_tokens = output['input_tokens']
+                    output_tokens = output['output_tokens']
+                    logprobs = output['logprobs']
+
+                    if params.logprobs:
+                        for i, lp in zip(indices, logprobs):
+                            cmpls['choices'][i]['logprobs']['content'].extend(lp)    
+
+                    cmpls['usage']['completion_tokens'] += sum(output_tokens)
+
+                    cmpls['usage']['total_tokens'] += sum(output_tokens)
+
+                    for i, t, fr in zip(indices, texts, finish_reasons):
+                        tc = json.loads(t)
+                        cmpls['choices'][i]['message']['tool_calls'].append(dict(
+                            index=0,
+                            id='call_' + uuid.uuid4().hex[:8],
+                            type='function',
+                            function=dict(name=tc['name'], arguments=json.dumps(tc['arguments']))
+                        ))
+
+            indices = list(range(len(cmpls['choices'])))
+            for i in indices:
+                if not cmpls['choices'][i]['message']['reasoning_content']:
+                    cmpls['choices'][i]['message']['reasoning_content'] = None
+                if not cmpls['choices'][i]['message']['content']:
+                    cmpls['choices'][i]['message']['content'] = None
+
+            return ChatCompletionOutput.model_validate(cmpls)
+
+        
+
+
+
+
+                
+                
+                        
+
+
+
+                    
+                    
+                    
+
+
+                
+
+                
+
+                        
+
+
+
+                        
+
+
+        
+        
+
+
+
+
+        
+
+        
+
+
+        

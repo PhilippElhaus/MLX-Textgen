@@ -31,7 +31,9 @@ def main():
         min_tokens: int = 20,
         max_reprocess_tokens: int = 250,
         replace_threshold: float = 0.95,
-        max_capacity: int = 50):
+        max_capacity: int = 50,
+        use_reasoning_content: bool = False
+        ):
         from .log_utils import get_logger
         from .engine import ModelConfig
         import yaml
@@ -52,7 +54,8 @@ def main():
                 min_tokens=min_tokens,
                 max_reprocess_tokens=max_reprocess_tokens,
                 replace_threshold=replace_threshold,
-                max_capacity=max_capacity
+                max_capacity=max_capacity,
+                use_reasoning_content=use_reasoning_content
             )
         elif config_file:
             with open(config_file, 'r') as f:
@@ -63,7 +66,7 @@ def main():
         
 
         config['model_configs'] = [ModelConfig.model_validate(mc) for mc in config['model_configs']]
-        config['logger'] = get_logger(__name__)
+        config['logger'] = get_logger("MLX Textgen")
         serve_api(**config)
 
     parser_serve = subparsers.add_parser('serve', help='Start the MLX Textgen OpenAI-cmopatible API server.')
@@ -89,6 +92,7 @@ def main():
     parser_serve.add_argument('--replace-threshold', type=float, default=0.95,
                         help='Percentage threshold to consider two cache similar in terms of token prefix. Affected by "max_reprocess_tokens" for longer prompts.')
     parser_serve.add_argument('--max-capacity', type=int, default=50, help='Maximum number of cache per model to save. Older ones will be discarded.')
+    parser_serve.add_argument('--use-reasoning-content', type=bool, default=False, help='Whether to put thoughts of reasoning models in reasoning_content instead of content in /v1/chat/completions endpoint.')
     parser_serve.set_defaults(func=config_and_serve)
 
     # Subcommand for creating config file
@@ -106,7 +110,8 @@ def main():
             min_tokens=20,
             max_reprocess_tokens=250,
             replace_threshold=0.95,
-            max_capacity=50
+            max_capacity=50,
+            use_reasoning_content=False
         )
         with open('model_config.yaml', 'w') as f:
             yaml.dump(config, f, sort_keys=False)

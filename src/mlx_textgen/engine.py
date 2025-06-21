@@ -6,6 +6,17 @@ if TYPE_CHECKING:
     from .model_utils import LLMModel
     from .generation_utils import TextCompletionOutput, ChatCompletionOutput
 
+def print_images_list(images: List):
+    new = []
+    for i in images:
+        if isinstance(i, list):
+            new.append(print_images_list(i))
+        elif isinstance(i, str):
+            new.append(i[:50])
+        else:
+            new.append(i)
+    return new
+
 class ModelConfig(BaseModel):
     model_id_or_path: str
     tokenizer_repo_or_path: Optional[str] = None
@@ -14,6 +25,7 @@ class ModelConfig(BaseModel):
     model_name: Optional[str] = None
     enable_cache: bool = True
     preprocess_batch_size: int = 512
+    extra_stop_words: Optional[Union[str, List[str]]] = None
     reasoning_parser: Optional[Literal['deepseek_r1']] = None
     default_template: Optional[DEFAULT_TEMPLATES] = None
 
@@ -34,9 +46,11 @@ class InferenceEngine:
             max_reprocess_tokens: int = 250,
             replace_threshold: float = 0.95,
             max_capacity: int = 50,
+            use_reasoning_content: bool = False,
             logger: Optional["Logger"] = None
         ):
         self._logger = logger
+        self._use_reasoning_content = use_reasoning_content
         from .model_utils import make_model_exist
         import time
         start = time.perf_counter()
@@ -136,6 +150,7 @@ class InferenceEngine:
             enable_cache=mc.enable_cache,
             cache_manage_config=self._cache_manage_config,
             preprocess_batch_size=mc.preprocess_batch_size,
+            extra_stop_words=mc.extra_stop_words,
             reasoning_parser=mc.reasoning_parser,
             default_template=mc.default_template
         )
@@ -274,7 +289,8 @@ class InferenceEngine:
             stream: bool = False,
             n: int = 1,
             max_completion_tokens: int = 4096,
-            max_reasoning_tokens: int = 0,
+            reasoning_effort: Optional[Literal['low', 'medium', 'high']] = None,
+            max_reasoning_tokens: Optional[int] = None,
             stop: Optional[List[str]] = None,
             response_format: Optional[Dict[str, Any]] = None,
             tools: Optional[List[Dict[str, Any]]] = None,
@@ -294,6 +310,7 @@ class InferenceEngine:
             guided_regex: Optional[str] = None,
             guided_grammar: Optional[str] = None,
             whitespace_pattern: Optional[str] = None,
+            use_reasoning_content: Optional[bool] = None,
             **kwargs
         ) -> Union["ChatCompletionOutput", Iterator["ChatCompletionOutput"]]:
         from .chat_utils import OpenAIToolSchema, build_function_call_schema, convert_tool_to_json_schema, ToolChoiceSchema, ResponseFormat
@@ -344,10 +361,22 @@ class InferenceEngine:
         self.load_model(model)
 
         if self.model.chat_template.reasoning_start:
-            _max_reasoning_tokens = max_reasoning_tokens
-        else:
+            rmap = dict(low=512, medium=2048, high=4096)
+            if max_reasoning_tokens is not None:
+                _max_reasoning_tokens = max_reasoning_tokens
+            elif reasoning_effort:
+                _max_reasoning_tokens = rmap(reasoning_effort)
+            else:
+                _max_reasoning_tokens = rmap['medium']
+
+        elif max_reasoning_tokens or reasoning_effort:
             _max_reasoning_tokens = 0
             self.log(f'Model "{self.model.model_name}" is not configured to support reasoning. Setting max_reasoning_tokens to 0.')
+
+        else:
+            _max_reasoning_tokens = 0
+
+        use_reasoning_content = self._use_reasoning_content if use_reasoning_content is None else use_reasoning_content
 
         if _max_reasoning_tokens:
             tparams = SamplingParams(
@@ -459,6 +488,8 @@ class InferenceEngine:
                     gen_outputs = [''] * len(indices)
                     status = [None] * len(indices)
                     toutput = self.model.stream(prompts=prompts, sampling_params=tparams, images=images, n=n, is_thinking=True)
+                    prefs = [self.model.chat_template.reasoning_start if not use_reasoning_content else ''] * len(indices)
+                    tend = self.model.chat_template.reasoning_end if self.model.chat_template.reasoning_end else ''
                     for gos in toutput:
                         gen_outputs = [t + go.token if not s else t for s, t, go in zip(status, gen_outputs, gos)]
                         cmpls = [dict(
@@ -470,19 +501,21 @@ class InferenceEngine:
                                 index=go.index, 
                                 delta=dict(
                                     content='',
-                                    reasoning_content=go.token if not s else None
-                                    ),
+                                    reasoning_content=p + go.token if not s else None
+                                    ) if use_reasoning_content else dict(
+                                        content=(p + go.token + tend if go.finish_reason else p + go.token) if not s else None),
                                 finish_reason=None,
                                 logprobs=dict(content=[go.logprobs]) if tparams.logprobs and (not s) else None
                             )]
-                        ) for s, go in zip(status, gos)]
+                        ) for s, go, p in zip(status, gos, prefs)]
+                        prefs = ['' if go.token is not None else p for p, go in zip(prefs, gos)]
                         if prompt_tokens is None:
                             prompt_tokens = [go.input_tokens for go in gos]
                         reasoning_tokens = [go.output_tokens if s else rt for s, go, rt in zip(status, gos, reasoning_tokens)]
                         status = [go.finish_reason if not s else s for s, go in zip(status, gos)]
 
                         for cmpl in cmpls:
-                            if cmpl['choices'][0]['delta']['reasoning_content'] is not None:
+                            if cmpl['choices'][0]['delta']['reasoning_content' if use_reasoning_content else 'content'] is not None:
                                 yield ChatCompletionOutput.model_validate(cmpl)
 
                     new_prompts = []
@@ -752,7 +785,10 @@ class InferenceEngine:
                 output_tokens = output['output_tokens']
                 logprobs = output['logprobs']
                 for i, t in zip(indices, texts):
-                    cmpls['choices'][i]['message']['reasoning_content'] = t
+                    if use_reasoning_content:
+                        cmpls['choices'][i]['message']['reasoning_content'] = t
+                    else:
+                        cmpls['choices'][i]['message']['content'] = self.model.chat_template.reasoning_start + t + self.model.chat_template.reasoning_end
                 if params.logprobs:
                     for i, lp in zip(indices, logprobs):
                         cmpls['choices'][i]['logprobs']['content'].extend(lp)                   
@@ -836,7 +872,7 @@ class InferenceEngine:
                 cmpls['usage']['total_tokens'] = cmpls['usage']['completion_tokens'] + cmpls['usage']['prompt_tokens']
 
                 for i, t, fr in zip(indices, texts, finish_reasons):
-                    cmpls['choices'][i]['message']['content'] = t
+                    cmpls['choices'][i]['message']['content'] += t
                     cmpls['choices'][i]['finish_reason'] = fr
 
                 if len([fr for fr in finish_reasons if fr == 'tool_calls']) > 0:

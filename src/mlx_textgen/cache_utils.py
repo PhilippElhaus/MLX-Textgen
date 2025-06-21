@@ -123,43 +123,34 @@ def load_cache(
     
     return cache, metadata
 
-def split_list_by_sublist(data_list: List[int], split_sublist: List[int]) -> List[List[int]]:
-    """Splits a list into sublists, using a specified sublist as the delimiter.
 
-    This function divides the input `data_list` into multiple sublists based on occurrences
-    of the `split_sublist`. Each sublist contains the elements between the `split_sublist` occurrences.
-
-    Args:
-        data_list (List[int]): The list of integers to be split.
-        split_sublist (List[int]): The sublist of integers used as the delimiter for splitting the `data_list`.
-
-    Returns:
-        List[List[int]]: A list of lists, where each inner list represents a sublist of the
-                         original `data_list` delimited by the `split_sublist`.
-    """
+def split_list_by_image_token(data_list: List[int], image_token_id: Union[int, List[int]]) -> Tuple[List[List[int]], List[List[int]]]:
     result = []
+    images = []
     current_sublist = []
-    i = 0
-    n = len(data_list)
-    m = len(split_sublist)
-
-    while i < n:
-        if i + m <= n and data_list[i:i + m] == split_sublist:
-            result.append(current_sublist)
-            current_sublist = []
-            i += m  # Skip the splitting sublist
+    img_sublist = []
+    token_set = [image_token_id] if isinstance(image_token_id, int) else image_token_id
+    for i in data_list:
+        if i not in token_set:
+            current_sublist.append(i)
+            if img_sublist:
+                images.append(img_sublist)
+                img_sublist = []
         else:
-            current_sublist.append(data_list[i])
-            i += 1
-
+            img_sublist.append(i)
+            if current_sublist:
+                result.append(current_sublist)
+                current_sublist = []
     result.append(current_sublist)
-
-    return result
+    if img_sublist:
+        images.append(img_sublist)
+    return result, images
 
 class CacheInfo(BaseModel):
     cache_id: str = Field(pattern='cache_\d+')
     token_ids: List[int]
     images: Optional[List[str]] = None
+    image_diffs: List[int] = Field(default_factory=list)
     last_modified: float
 
     @property
@@ -203,8 +194,8 @@ class CacheManager:
     def __init__(self, 
             model_name: str,
             is_vision: bool = False,
-            image_token_id: Optional[int] = None, 
-            num_tokens_per_image: Optional[int] = None,
+            image_token_id: Optional[int] = None,
+            extra_image_tokens: Optional[List[int]] = None,
             min_tokens: int = 20,
             max_reprocess_tokens: int = 250,
             replace_threshold: float = 0.95,
@@ -223,11 +214,9 @@ class CacheManager:
             model_name (str): A unique identifier for the model using this cache manager.
                 Used to create a dedicated cache directory within the mlx prompt cache directory.
             is_vision (bool, optional): Whether the model is a vision model (accepts images as input).
-                Defaults to False.  If True, `image_token_id` and `num_tokens_per_image` must be set.
+                Defaults to False.  If True, `image_token_id` must be set.
             image_token_id (Optional[int], optional): The token ID that represents an image in the model's
                 vocabulary. Required if `is_vision` is True. Defaults to None.
-            num_tokens_per_image (Optional[int], optional): The number of tokens used to represent each image.
-                Required if `is_vision` is True. Defaults to None.
             min_tokens (int, optional): The minimum number of tokens a prompt must have to be considered
                 for caching. Prompts shorter than this length will not be cached. Defaults to 20.
             max_reprocess_tokens (int, optional): When comparing sequences to determine if one sequence should be replaced by
@@ -242,8 +231,6 @@ class CacheManager:
                 Defaults to None.
 
         Raises:
-            ValueError: If `num_tokens_per_image` is None when `is_vision` is True.
-            ValueError: If `num_tokens_per_image` is not a positive integer when `is_vision` is True.
             ValueError: If `image_token_id` is None when `is_vision` is True.
             ValueError: If `min_tokens` is less than 0.
             ValueError: If `max_capacity` is less than 1.
@@ -257,16 +244,6 @@ class CacheManager:
         self.cache_dir = os.path.join(get_prompt_cache_dir(), model_name)
         os.makedirs(self.cache_dir, exist_ok=True)
         self.cache_info_dir = os.path.join(self.cache_dir, 'cached_prompts.json')
-
-        if is_vision and (num_tokens_per_image is None):
-            error = '"num_tokens_per_images" cannot be None for vision model.'
-            self.log(error, level='error')
-            raise ValueError(error)
-
-        if is_vision and (num_tokens_per_image < 1):
-            error = '"num_tokens_per_images" needs to be a positive integer for vision model.'
-            self.log(error, level='error')
-            raise ValueError(error)
         
         if is_vision and (image_token_id is None):
             error = '"image_token_id" cannot be None for vision model.'
@@ -296,7 +273,9 @@ class CacheManager:
         self.model_name = model_name
         self.is_vision = is_vision
         self.image_token_id = image_token_id
-        self.num_tokens_per_image = num_tokens_per_image
+        self._image_tokens = [] if not extra_image_tokens else extra_image_tokens
+        if (self.image_token_id not in self._image_tokens) and self.is_vision:
+            self._image_tokens.append(self.image_token_id)
         self.min_tokens = min_tokens
         self.max_reprocess_tokens = max_reprocess_tokens
         self.replace_threshold = replace_threshold
@@ -390,7 +369,7 @@ class CacheManager:
         """
         import json
         cach_info_dict = {
-            cf.cache_id: (dict(token_ids=cf.token_ids, images=cf.images, last_modified=cf.last_modified) if self.is_vision else dict(token_ids=cf.token_ids, last_modified=cf.last_modified)) for cf in self.cache_info
+            cf.cache_id: (dict(token_ids=cf.token_ids, images=cf.images, image_diffs=cf.image_diffs, last_modified=cf.last_modified) if self.is_vision else dict(token_ids=cf.token_ids, last_modified=cf.last_modified)) for cf in self.cache_info
             }
         with open(self.cache_info_dir, 'w') as f:
             json.dump(cach_info_dict, f, indent=4)
@@ -480,7 +459,7 @@ class CacheManager:
         clear_cache()
         return new_cache
 
-    def search_cache_non_vision(self, token_ids: List[int], cache_info: Optional[List[CacheInfo]] = None) -> Optional[Tuple[str, int]]:
+    def search_cache_non_vision(self, token_ids: List[int], cache_info: Optional[List[CacheInfo]] = None) -> Optional[Tuple[str, int, int]]:
         """Searches the cache for a matching prefix of token IDs (non-vision model).
 
         This function searches the existing cached prompts for the longest matching prefix
@@ -522,12 +501,12 @@ class CacheManager:
             current_shared -= 1
 
         if selected and (current_shared > 0):
-            return selected, current_shared
+            return selected, current_shared, 0
         
         else:
             return
         
-    def search_cache_vision(self, token_ids: List[int], images: Optional[List[str]] = None) -> Optional[Tuple[str, int]]:
+    def search_cache_vision(self, token_ids: List[int], images: Optional[List[str]] = None) -> Optional[Tuple[str, int, int]]:
         """Searches the cache for a matching prefix of token IDs and images (vision model).
 
         This function attempts to find the best matching cache entry for a given input consisting of token IDs and,
@@ -556,75 +535,91 @@ class CacheManager:
         if (not images) or (len(self.cache_info) == 0):
             return self.search_cache_non_vision(token_ids=token_ids)
         
-
-
         cache_info = self.cache_info
-        from itertools import takewhile        
-        img_seq = [self.image_token_id] * self.num_tokens_per_image
+        from itertools import takewhile
 
         selected = None
         current_shared = 0
+        current_diffs = []
         slen = max([cf.length for cf in cache_info])
-
+        st_chunks, si_chunks = split_list_by_image_token(token_ids, self._image_tokens)
+        simage_lens = [len(i) for i in si_chunks]
 
         for cf in cache_info:
-            shared = sum([1 for _ in takewhile(lambda x: x[0] == x[1], zip(token_ids, cf.token_ids))])
+            shared = len(list(takewhile(lambda x: x[0] == x[1], zip(token_ids, cf.token_ids))))
+            ct_chunks, ci_chunks = split_list_by_image_token(cf.token_ids, self._image_tokens)
+            cimage_lens = [len(i) for i in ci_chunks]
+            diffs = cf.image_diffs
+            image_lens_in_shared = [len(i) for i in split_list_by_image_token(token_ids[:shared], self._image_tokens)[1]]
+            num_images_in_shared = len(image_lens_in_shared)
+            diffs_in_shared = diffs[:num_images_in_shared]
+            if (num_images_in_shared > 0) and ((simage_lens[num_images_in_shared - 1] != image_lens_in_shared[-1]) or (cimage_lens[num_images_in_shared - 1] != image_lens_in_shared[-1])):
+                shared -= image_lens_in_shared[-1]
+                image_lens_in_shared = image_lens_in_shared[:-1]
+                num_images_in_shared -= 1 
+                diffs_in_shared = diffs_in_shared[:-1]
+
             if shared > current_shared:
-                num_images_in_shared = len([t for t in token_ids[:shared] if t == self.image_token_id]) // self.num_tokens_per_image
                 if num_images_in_shared == 0:
                     selected = cf.cache_id
                     current_shared = shared
+                    current_diffs = []
                     slen = cf.length
 
                 else: # Compare the images
                     oimages = images[:num_images_in_shared]
                     cimages = cf.images[:num_images_in_shared]
-                    shared_images = sum([1 for _ in takewhile(lambda x: x[0] == x[1], zip(oimages, cimages))])
+                    shared_images = len(list(takewhile(lambda x: x[0] == x[1], zip(oimages, cimages))))
                     if len(oimages) == shared_images:
                         selected = cf.cache_id
                         current_shared = shared
+                        current_diffs = diffs_in_shared
                         slen = cf.length
                     else:
-                        text_seqs = split_list_by_sublist(token_ids[:shared], img_seq)
+                        text_seqs, img_seqs = split_list_by_image_token(token_ids[:shared], self._image_tokens)
                         shared_seq = text_seqs[0]
                         for i in range(shared_images):
-                            shared_seq += img_seq + text_seqs[i + 1]
+                            shared_seq += img_seqs[i] * + text_seqs[i + 1]
                         shared = len(shared_seq)
                         if shared > current_shared:
                             selected = cf.cache_id
                             current_shared = shared
+                            current_diffs = diffs_in_shared[:shared_images]
                             slen = cf.length
 
             elif (shared == current_shared) and (cf.length < slen) and (current_shared != 0):
-                num_images_in_shared = len([t for t in token_ids[:shared] if t == self.image_token_id]) // self.num_tokens_per_image
                 if num_images_in_shared == 0:
                     selected = cf.cache_id
                     current_shared = shared
+                    current_diffs = []
                     slen = cf.length
 
                 else: # Compare the images
                     oimages = images[:num_images_in_shared]
                     cimages = cf.images[:num_images_in_shared]
-                    shared_images = sum([1 for _ in takewhile(lambda x: x[0] == x[1], zip(oimages, cimages))])
+                    shared_images = len(list(takewhile(lambda x: x[0] == x[1], zip(oimages, cimages))))
                     if len(oimages) == shared_images:
                         selected = cf.cache_id
                         current_shared = shared
-                        
+                        current_diffs = diffs_in_shared
                         slen = cf.length
+
         # Need to have at least one token for the model to process before generation.
         if selected and (current_shared == len(token_ids)):
-            if token_ids[current_shared - 1] != self.image_token_id:
+            if token_ids[current_shared - 1] not in self._image_tokens:
                 current_shared -= 1
             else: # Need to remove the entire image
-                current_shared -= self.num_tokens_per_image
+                current_shared -= split_list_by_image_token(token_ids[:current_shared], self._image_tokens)[1][-1]
+                current_diffs = current_diffs[:-1]
 
         if selected and (current_shared > 0):
-            return selected, current_shared
+            out_diffs = sum(current_diffs) if current_diffs else 0
+            return selected, current_shared, out_diffs
         
         else:
             return
 
-    def search_cache(self, token_ids: List[int], images: Optional[List[str]] = None) -> Optional[Tuple[str, int]]:
+    def search_cache(self, token_ids: List[int], images: Optional[List[str]] = None) -> Optional[Tuple[str, int, int]]:
         """Searches the cache for a matching prompt.
 
         This method intelligently searches the cache, using either `search_cache_vision` for
@@ -652,7 +647,7 @@ class CacheManager:
             token_ids: "array",
             offsets: "array",
             images: Optional[List[Optional[List[str]]]] = None
-        ) -> List[Union["KVCache", "RotatingKVCache"]]:
+        ) -> Tuple[List[Union["KVCache", "RotatingKVCache"]], int]:
         """Retrieves and pre-fills the KV cache based on existing cached prompts, maximizing reuse for accelerated generation.
 
         This function searches the cache for the longest matching prefixes of the given token ID sequences
@@ -695,20 +690,23 @@ class CacheManager:
             cache = create_cache_fn()
             end = time.perf_counter()
             self.log(f'Existing cache not required as the prompts have fewer than {self.min_tokens} tokens. Time taken: {end - start:.3f}s.')
-            return cache
+            return cache, 0
 
         offset_list = offsets.tolist()
         token_seqs = [t[o:] for t, o in zip(token_ids.tolist(), offset_list)]
         search_results = [self.search_cache(tids, images[i]) for i, tids in enumerate(token_seqs)]
-        coverage = [0 if sr is None else sr[1] + o for sr, o in zip(search_results, offset_list)]
+        coverage = [0 if sr is None else sr[1] + o - sr[2] for sr, o in zip(search_results, offset_list)]
 
         cache = create_cache_fn()
         min_coverage = min(coverage)
 
+        token_offset_index = [i for i, c in enumerate(coverage) if c == min_coverage][0]
+        token_offset = search_results[token_offset_index][1] + offset_list[token_offset_index] if search_results[token_offset_index] else 0
+
         if min_coverage == 0:
             end = time.perf_counter()
             self.log(f'No suitable cache found. Time taken: {end - start:.3f}s.')
-            return cache
+            return cache, token_offset
         
         import os
         from datetime import datetime
@@ -752,8 +750,8 @@ class CacheManager:
         
         cache_id_str = ', '.join([f'"{cid}"' for cid in cache_to_load])
         end = time.perf_counter()
-        self.log(f'Reusing cache {cache_id_str}. {min_coverage} tokens for each prompt prefilled. Time taken: {end - start:.3f}s.')
-        return cache
+        self.log(f'Reusing cache {cache_id_str}. {token_offset} tokens for each prompt prefilled. Time taken: {end - start:.3f}s.')
+        return cache, token_offset
     
     def find_seq_to_keep_drop_update(self, token_ids: List[List[int]], images: Optional[List[Optional[List[str]]]] = None) -> Tuple[List[int], List[str], List[str]]:
         """Identifies sequences to keep, drop, or update in the cache.
@@ -795,7 +793,6 @@ class CacheManager:
             return []
 
         # self comparing
-        img_seq = [self.image_token_id] * self.num_tokens_per_image if self.is_vision else []
         to_process: List[SeqIndex] = [s for s in seqs]
         cont_seqs: List[SeqIndex] = []
         done_seqs = []
@@ -805,23 +802,35 @@ class CacheManager:
 
             strong_seqs = []
             num_images = 0 if (not seq.images) or (not self.is_vision) else len(seq.images)
+            st_chunks, si_chunks = split_list_by_image_token(seq.token_ids, image_token_id=self._image_tokens)
+            simage_lens = [len(i) for i in si_chunks]
 
             for cseq in comp:
-                num_share = sum([1 for _ in takewhile(lambda x: x[0] == x[1], zip(seq.token_ids, cseq.token_ids))])
+                num_share = len(list(takewhile(lambda x: x[0] == x[1], zip(seq.token_ids, cseq.token_ids))))
                 slen = seq.length
                 clen = cseq.length
                 if num_images:
-                    num_images_in_share = len([t for t in seq.token_ids[:num_share] if t == self.image_token_id]) // self.num_tokens_per_image
+                    ct_chunks, ci_chunks = split_list_by_image_token(cseq.token_ids, image_token_id=self._image_tokens)
+                    cimage_lens = [len(i) for i in ci_chunks]
+                    image_lens_in_shared = [len(i) for i in split_list_by_image_token(seq.token_ids[:num_share], self._image_tokens)[1]]
+                    num_images_in_shared = len(image_lens_in_shared)
+                    if (num_images_in_shared > 0) and ((simage_lens[num_images_in_shared - 1] != image_lens_in_shared[-1]) or (cimage_lens[num_images_in_shared - 1] != image_lens_in_shared[-1])):
+                        num_share -= image_lens_in_shared[-1]
+                        image_lens_in_shared = image_lens_in_shared[:-1]
+                        num_images_in_shared -= 1 
+
                     if cseq.images:
-                        num_share_images = sum([1 for _ in takewhile(lambda x: x[0] == x[1], zip(seq.images[:num_images_in_share], cseq.images[:num_images_in_share]))])
+                        num_share_images = len(list(takewhile(lambda x: x[0] == x[1], zip(seq.images[:num_images_in_shared], cseq.images[:num_images_in_shared]))))
                     else:
                         num_share_images = 0
-                    if num_share_images != num_images_in_share:
-                        text_seqs = split_list_by_sublist(seq.token_ids[:num_share], img_seq)
+
+                    if num_share_images != num_images_in_shared:
+                        text_seqs, img_seqs = split_list_by_image_token(seq.token_ids[:num_share], self._image_tokens)
                         shared_seq = text_seqs[0]
                         for i in range(num_share_images):
-                            shared_seq += img_seq + text_seqs[i + 1]
+                            shared_seq += img_seqs[i] + text_seqs[i + 1]
                         num_share = len(shared_seq)
+
                 min_len = min(slen, clen)
                 threshold = max(self.replace_threshold, (min_len - self.max_reprocess_tokens) / min_len)
                 if (clen > slen) and ((num_share / slen) > threshold):
@@ -851,22 +860,32 @@ class CacheManager:
             to_update = None
             to_update_len = 0
             num_images = 0 if (not seq.images) or (not self.is_vision) else len(seq.images)
+            st_chunks, si_chunks = split_list_by_image_token(seq.token_ids, image_token_id=self._image_tokens)
+            simage_lens = [len(i) for i in si_chunks]
 
             for cseq in existing_cache:
                 num_share = sum([1 for _ in takewhile(lambda x: x[0] == x[1], zip(seq.token_ids, cseq.token_ids))])
                 slen = seq.length
                 clen = cseq.length
                 if num_images:
-                    num_images_in_share = len([t for t in seq.token_ids[:num_share] if t == self.image_token_id]) // self.num_tokens_per_image
+                    ct_chunks, ci_chunks = split_list_by_image_token(cseq.token_ids, image_token_id=self._image_tokens)
+                    cimage_lens = [len(i) for i in ci_chunks]
+                    image_lens_in_shared = [len(i) for i in split_list_by_image_token(seq.token_ids[:num_share], self._image_tokens)[1]]
+                    num_images_in_shared = len(image_lens_in_shared)
+                    if (num_images_in_shared > 0) and ((simage_lens[num_images_in_shared - 1] != image_lens_in_shared[-1]) or (cimage_lens[num_images_in_shared - 1] != image_lens_in_shared[-1])):
+                        num_share -= image_lens_in_shared[-1]
+                        image_lens_in_shared = image_lens_in_shared[:-1]
+                        num_images_in_shared -= 1 
+
                     if cseq.images:
-                        num_share_images = sum([1 for _ in takewhile(lambda x: x[0] == x[1], zip(seq.images[:num_images_in_share], cseq.images[:num_images_in_share]))])
+                        num_share_images = sum([1 for _ in takewhile(lambda x: x[0] == x[1], zip(seq.images[:num_images_in_shared], cseq.images[:num_images_in_shared]))])
                     else:
                         num_share_images = 0
-                    if num_share_images != num_images_in_share:
-                        text_seqs = split_list_by_sublist(seq.token_ids[:num_share], img_seq)
+                    if num_share_images != num_images_in_shared:
+                        text_seqs, img_seqs = split_list_by_image_token(seq.token_ids[:num_share], self._image_tokens)
                         shared_seq = text_seqs[0]
                         for i in range(num_share_images):
-                            shared_seq += img_seq + text_seqs[i + 1]
+                            shared_seq += img_seqs[i] + text_seqs[i + 1]
                         num_share = len(shared_seq)
                 min_len = min(slen, clen)
                 threshold = max(self.replace_threshold, (min_len - self.max_reprocess_tokens) / min_len)
@@ -893,7 +912,8 @@ class CacheManager:
             token_ids: "array",
             offsets: "array",
             create_cache_fn: Callable[[], List[Union["KVCache", "RotatingKVCache"]]],
-            images: Optional[List[Optional[List[str]]]] = None
+            images: Optional[List[Optional[List[str]]]] = None,
+            image_diffs: Optional[List[List[int]]] = None
         ) -> None:
         """Saves the provided KV cache to disk for later reuse.
 
@@ -939,7 +959,9 @@ class CacheManager:
             return
 
         B, kv_heads, num_tokens, embed_size = cache[0].keys[..., :cache[0].offset, :].shape
-
+        if (image_diffs is not None) and (image_diffs[0]):
+            num_tokens += sum(image_diffs[0])
+            
         if num_tokens != token_ids.shape[1]:
             error = 'Number of tokens and token ids mismatch while saving cache.'
             self.log(msg=error, level='error')
@@ -969,7 +991,7 @@ class CacheManager:
             return
 
         keep, drop, update = self.find_seq_to_keep_drop_update(token_seqs, images=images)
-        
+
         if update:
             ts = datetime.now().timestamp()
             for cid in update:
@@ -987,9 +1009,11 @@ class CacheManager:
             self.drop_cache_by_id(drop)
 
         if keep:
+            images = [None] * len(token_seqs) if images == None else images
+            image_diffs = [[]] * len(token_seqs) if image_diffs == None else image_diffs
             ts = datetime.now().timestamp()
             new_ids = self.get_new_cache_id(num=len(keep))
-            new_cache_infos = [CacheInfo(cache_id=cid, token_ids=tids, images=images, last_modified=ts) for tids, cid in zip(token_seqs, new_ids)]
+            new_cache_infos = [CacheInfo(cache_id=cid, token_ids=tids, images=img, image_diffs=imd, last_modified=ts) for tids, img, imd, cid in zip(token_seqs, images, image_diffs, new_ids)]
             new_files = [os.path.join(self.cache_dir, f'{cid}.safetensors') for cid in new_ids]
             for c, nf in zip(caches, new_files):
                 save_cache(cache=c, file=nf, model_name=self.model_name, logger=self._logger)

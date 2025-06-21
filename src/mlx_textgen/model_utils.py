@@ -28,11 +28,13 @@ class InferencePlan:
     token_ids: "array"
     cache: List[Union["KVCache", "RotatingKVCache"]]
     cache_offset: int
+    token_offset: int
     offsets: "array"
-    prompt_batches: List[Tuple[Tuple[int, int], Optional[Tuple[int, int]]]]
+    prompt_batches: List[Tuple[Tuple[int, int], Optional[Tuple[int, int, int]]]]
     attention_mask: "array"
     b64_images: Optional[List[Optional[List[str]]]] = None
     pixel_values: Optional["array"] = None
+    kwargs_list: Optional[List[Optional[Dict[str, Any]]]] = None
     
 @contextlib.contextmanager
 def wired_limit(model: "Module", streams: Optional[List["Stream"]] = None):
@@ -108,7 +110,7 @@ def image_to_b64_string(image: str, cache_dir: str) -> str:
             b64_str = b64encode(f.read()).decode('utf-8')
 
     elif image.startswith('data:'):
-        b64_str = image.removeprefix('data:').split(';base64,')
+        b64_str = image.removeprefix('data:').split(';base64,')[-1]
 
     else:
         b64_str = image
@@ -213,6 +215,7 @@ class LLMModel:
             enable_cache: bool = True,
             cache_manage_config: Optional[Dict[str, Any]] = None,
             preprocess_batch_size: int = 512,
+            extra_stop_words: Optional[Union[str, List[str]]] = None,
             reasoning_parser: Optional[Literal['deepseek_r1']] = None,
             default_template: Optional["DEFAULT_TEMPLATES"] = None,
             **kwargs
@@ -222,6 +225,9 @@ class LLMModel:
         self._logger = logger
         self._verbose = verbose
         self._model_id_or_path = model_id_or_path
+        self._extra_stop_words = [] if extra_stop_words is None else extra_stop_words
+        if isinstance(self._extra_stop_words, str):
+            self._extra_stop_words = [self._extra_stop_words]
         self._tokenizer_repo_or_path = tokenizer_repo_or_path if tokenizer_repo_or_path else model_id_or_path
         model_kwargs = model_kwargs if model_kwargs else {}
         tokenizer_kwargs = tokenizer_kwargs if tokenizer_kwargs else {}
@@ -237,7 +243,7 @@ class LLMModel:
             model_name=self.model_real_name, 
             is_vision=self.is_vision,
             image_token_id=self.image_token_id,
-            num_tokens_per_image=self.num_tokens_per_image,
+            extra_image_tokens=self.extra_image_tokens,
             logger=self._logger,
             **cache_manage_config
         )
@@ -336,7 +342,9 @@ class LLMModel:
         Returns:
             Optional[int]: The token ID of the image placeholder, or None if not found in the configuration.
         """
-        return self.config.get('image_token_index')
+        if not hasattr(self, '_image_token_id'):
+            self._image_token_id = self.config.get('image_token_index', self.config.get('image_token_id'))
+        return self._image_token_id
     
     @property
     def boi_token_id(self) -> Optional[int]:
@@ -365,18 +373,16 @@ class LLMModel:
         return self.config.get('eoi_token_index')
     
     @property
-    def num_tokens_per_image(self) -> Optional[int]:
-        """Retrieves the number of tokens to represent each image.
-
-        Some multimodal models represent images as a sequence of tokens.
-        This property returns the number of tokens used for each image.
-        The value is read from the model's configuration under the
-        'mm_tokens_per_image' key.
-
-        Returns:
-            Optional[int]: The number of tokens per image, or None if not found in the configuration.
-        """
-        return self.config.get('mm_tokens_per_image')
+    def extra_image_tokens(self) -> List[int]:
+        if not hasattr(self, '_extra_image_tokens'):
+            self._extra_image_tokens = []
+            if self.config['model_type'] == 'mistral3':
+                img_break_tokens = self.tokenizer('[IMG_BREAK]', add_special_tokens=False)['input_ids']
+                if len(img_break_tokens) == 1:
+                    self._extra_image_tokens.append(img_break_tokens[0])
+                else:
+                    self.log(msg='Cannot add image break token for "mistral3" model.', level='warning')
+        return self._extra_image_tokens
     
     @property
     def processor(self) -> Optional["ProcessorMixin"]:
@@ -644,7 +650,9 @@ class LLMModel:
             self._tokenizer = self._processor.tokenizer
             if self._tokenizer.chat_template is None:
                 self._tokenizer.chat_template = self._processor.chat_template
-        
+            elif (self._processor.chat_template) and (self._processor.chat_template != self._tokenizer.chat_template):
+                self._tokenizer.chat_template = self._processor.chat_template
+
         else:
             from transformers import AutoTokenizer
             self._processor = None
@@ -743,12 +751,11 @@ class LLMModel:
         self.log(f'Prepared inputs for model "{self.model_name}". Time taken: {end - start:.3f}s.')
         return inputs
     
-    def _create_batches(self, token_ids: "array", pixel_values: Optional["array"] = None) -> List[Tuple[Tuple[int, int], Optional[Tuple[int, int]]]]:
+    def _create_batches(self, token_ids: "array", pixel_values: Optional["array"] = None) -> List[Tuple[Tuple[int, int], Optional[Tuple[int, int, int]]]]:
         num_tokens = token_ids.shape[1]
         num_images = pixel_values.shape[0] if (pixel_values is not None) and self.is_vision else 0
 
-        if not num_images:
-            batch_size = self.preprocess_batch_size
+        def get_batch_tuples(num_tokens: int, batch_size: int) -> List[Tuple[int, int]]:
             num_batches = (num_tokens // batch_size) + 1 if num_tokens % batch_size else (num_tokens // batch_size)
             batches = [
                 (
@@ -757,32 +764,51 @@ class LLMModel:
                 )
                 for i in range(num_batches)
             ]
+            return batches
+
+        if not num_images:
+            batches = get_batch_tuples(num_tokens, self.preprocess_batch_size)
             return [(b, None) for b in batches]
         
         else:
-            image_map = (token_ids == self.image_token_id).sum(axis=0).tolist()
-            batches = find_conseq_indices_pairs(image_map, self.preprocess_batch_size)
-            batches = [((s, e), (e - s) // self.num_tokens_per_image if b else 0) for (s, e), b in batches]
-            assigned_images = 0
-            current_start = 0
-            current_images = 0
-            current_batch_size = 0
+            # Only work with batch size=1
+            from .cache_utils import split_list_by_image_token
+            text_seqs, img_seqs = split_list_by_image_token(token_ids[0].tolist(), [self.image_token_id] + self.extra_image_tokens)
+            text_batches = [get_batch_tuples(len(ts), self.preprocess_batch_size) for ts in text_seqs]
+            text_sizes = [[(tb[1] - tb[0], False) for tb in tbs] for tbs in text_batches]
+            image_sizes = [(len(i), True) for i in img_seqs]
+            chunk_sizes = text_sizes[0]
+            for i in range(len(image_sizes)):
+                chunk_sizes.append(image_sizes[i])
+                chunk_sizes.extend(text_sizes[i + 1])
+            
             final_batches = []
-            for i, ((s, e), ni) in enumerate(batches):
-                current_images += ni
-                current_batch_size += e - s
-                if current_batch_size >= self.preprocess_batch_size:
-                    image_batch = (assigned_images, current_images + assigned_images) if current_images > 0 else None
-                    assigned_images += current_images
-                    current_images = 0
-                    token_batch = (current_start, e)
-                    current_start = e
-                    current_batch_size = 0
-                    final_batches.append((token_batch, image_batch))
-                elif (i + 1) == len(batches):
-                    image_batch = (assigned_images, current_images + assigned_images) if current_images > 0 else None
-                    token_batch = (current_start, e)
-                    final_batches.append((token_batch, image_batch))
+            current_start = 0
+            current_end = 0
+            current_image_start = 0
+            current_image_end = 0
+            current_size = 0
+
+            for size, is_image in chunk_sizes:
+                current_size += size
+                current_end += size
+                if is_image:
+                    current_image_end += 1
+
+                if (current_size >= self.preprocess_batch_size) or is_image:
+                    t_batch = (current_start, current_end)
+                    i_batch = None if current_image_end == current_image_start else (current_image_start, current_image_end, size)
+                    final_batches.append((t_batch, i_batch))
+
+                    current_size = 0
+                    current_start = current_end 
+                    current_image_start = current_image_end
+
+            if current_size:
+                t_batch = (current_start, current_end)
+                i_batch = None if current_image_end == current_image_start else (current_image_start, current_image_end, size)
+                final_batches.append((t_batch, i_batch))
+
             return final_batches
 
     def create_inference_plan(self,
@@ -803,11 +829,14 @@ class LLMModel:
 
         start = time.perf_counter()
 
+        from .cache_utils import split_list_by_image_token
+        from mlx.core import array
+
         b64_images = inputs.get('b64_images')
         b64_images = b64_images if b64_images else [None] * inputs['input_ids'].shape[0]
 
         if self.enable_cache:
-            cache = self.cache_manager.get_cache(
+            cache, token_offset = self.cache_manager.get_cache(
                 create_cache_fn=self.get_empty_cache,
                 token_ids=inputs['input_ids'],
                 offsets=inputs['offsets'],
@@ -815,12 +844,13 @@ class LLMModel:
             )
         else:
             cache = self.get_empty_cache()
+            token_offset = 0
 
         token_ids = inputs['input_ids']
-        tokens_to_process = token_ids[:, cache[0].offset:]
-        processed_tokens = token_ids[:, :cache[0].offset]
+        tokens_to_process = token_ids[:, token_offset:]
+        processed_tokens = token_ids[:, :token_offset]
         num_processed_images = [
-            ((processed_tokens[i] == self.image_token_id).sum().tolist() // self.num_tokens_per_image) 
+            len(split_list_by_image_token(processed_tokens[i].tolist(), image_token_id=self.image_token_id)[1])
             for i in range(token_ids.shape[0])
             ] if self.is_vision and (processed_tokens.shape[1] != 0) else [0] * token_ids.shape[0]
         pixel_values = inputs.get('pixel_values')
@@ -829,20 +859,35 @@ class LLMModel:
         final_batches = [
             (
                 (ts + cache[0].offset, te + cache[0].offset),
-                img if img is None else (img[0] + num_processed_images[0], img[1] + num_processed_images[0])
+                img if img is None else (img[0] + num_processed_images[0], img[1] + num_processed_images[0], img[2])
             )
             for (ts, te), img in batches
         ]
+
+        kwargs_list = [dict()] * len(final_batches)
+
+        kwargs_keys = [k for k in inputs.keys() if k not in ('input_ids', 'attention_mask', 'pixel_values', 'offsets', 'b64_images')]
+        
+        for kw in kwargs_keys:
+            val = inputs[kw]
+            # print(kw, val)
+            # print(inputs.get('pixel_values').shape)
+            if isinstance(val, array) and (inputs.get('pixel_values') is not None) and (inputs.get('pixel_values').shape[0] == val.shape[0]):
+                for i in range(len(kwargs_list)):
+                    if final_batches[i][1]:
+                        kwargs_list[i][kw] = val[final_batches[i][1][0]:final_batches[i][1][1]]
 
         output = InferencePlan(
             token_ids=token_ids,
             cache=cache,
             cache_offset=cache[0].offset,
+            token_offset=token_offset,
             offsets=inputs['offsets'],
             prompt_batches=final_batches,
             attention_mask=inputs['attention_mask'],
             b64_images=inputs.get('b64_images'),
-            pixel_values=pixel_values
+            pixel_values=pixel_values,
+            kwargs_list=kwargs_list
         )
         end = time.perf_counter()
         self.log(f'Inference plan created. Time taken: {end - start:.3f}s.')
@@ -852,7 +897,8 @@ class LLMModel:
             token_ids: "array",
             cache: List[Union["KVCache", "RotatingKVCache"]],
             mask: Optional["array"],
-            pixel_values: Optional['array'] = None
+            pixel_values: Optional['array'] = None,
+            **kwargs
             ) -> "array":
         """The core inference from the mlx model.
 
@@ -868,12 +914,12 @@ class LLMModel:
         from mlx.core import stream
         with stream(GENERATION_STREAM):
             if self.is_vision:
-                return self.model(token_ids, cache=cache, mask=mask, pixel_values=pixel_values).logits[:, -1, :]
+                return self.model(token_ids, cache=cache, mask=mask, pixel_values=pixel_values, **kwargs).logits[:, -1, :]
             
             else:
                 return self.model(token_ids, cache=cache)[:, -1, :]
         
-    def process_prompt(self, inference_plan: InferencePlan) -> "array":
+    def process_prompt(self, inference_plan: InferencePlan) -> Tuple["array", List[List[int]]]:
         import time
         start = time.perf_counter()
 
@@ -883,27 +929,35 @@ class LLMModel:
         token_ids = inference_plan.token_ids
         num_prompts = token_ids.shape[0]
         num_tokens = num_prompts * token_ids.shape[1]
-        processed_tokens = inference_plan.cache_offset * num_prompts
+        processed_tokens = inference_plan.token_offset * num_prompts
         unprocessed_tokens = num_tokens - processed_tokens
         processed = 0
+        kwargs_dicts = inference_plan.kwargs_list if inference_plan.kwargs_list else [dict()] * len(inference_plan.prompt_batches)
+        image_diffs = []
 
         with wired_limit(self.model, streams=[GENERATION_STREAM]):
-            for (ts, te), img in inference_plan.prompt_batches:
+            for ((ts, te), img), kw in zip(inference_plan.prompt_batches, kwargs_dicts):
                 bstart = time.perf_counter()
                 batch_size = (te - ts) * num_prompts
                 processed += batch_size
                 pixel_values = inference_plan.pixel_values[img[0]:img[1]] if img else None
-                logits = self._inference(token_ids=token_ids[:, ts:te], cache=inference_plan.cache, mask=inference_plan.attention_mask[:te], pixel_values=pixel_values)
+                image_size = img[2] if img else None
+                logits = self._inference(token_ids=token_ids[:, ts:te], cache=inference_plan.cache, mask=inference_plan.attention_mask[:, :te], pixel_values=pixel_values, **kw)
                 eval([c.state for c in inference_plan.cache])
+                if image_size:
+                    diff_till_now = sum(image_diffs) if image_diffs else 0
+                    img_diff = token_ids[:, :te].shape[1] - inference_plan.cache[0].offset - diff_till_now
+                    image_diffs.append(img_diff)
                 clear_cache()
                 bend = time.perf_counter() - bstart
                 tps = batch_size / bend
-                self.log(f'Total of {processed}/{unprocessed_tokens} processed tokens. Batch size: {batch_size} tokens. Time taken for current batch: {bend:.3f}s. {tps:.3f} t/s.')
+                image_msg = f'Image tokens length: {image_size}. '
+                self.log(f'Total of {processed}/{unprocessed_tokens} processed tokens. {image_msg}Batch size: {batch_size} tokens. Time taken for current batch: {bend:.3f}s. {tps:.3f} t/s.')
 
         end = time.perf_counter() - start
         tps = num_tokens / end
         self.log(f'Processed {num_tokens} tokens in total. Total time taken: {end:.3f}s. {tps:.3f} t/s.')
-        return logits
+        return logits, [image_diffs] if image_diffs else [[]] * inference_plan.token_ids.shape[0]
     
     def _get_logprobs(self, logprobs: "array", current_ids: "array", current_tokens: List[str], top_logprobs: int, row_range: "array"):
         from mlx.core import argsort, inf, where
@@ -928,7 +982,7 @@ class LLMModel:
         ]
         return output
 
-    def _stream(self, inference_plan: InferencePlan, logits: "array", sampling_params: "SamplingParams", is_thinking: bool = False) -> Iterator[List["GenerationOutput"]]:
+    def _stream(self, inference_plan: InferencePlan, logits: "array", image_diffs: List[List[int]], sampling_params: "SamplingParams", is_thinking: bool = False) -> Iterator[List["GenerationOutput"]]:
         from time import perf_counter
 
         start = perf_counter()
@@ -945,6 +999,9 @@ class LLMModel:
         stop = sampling_params.stop if sampling_params.stop else []
         if self.tokenizer.eos_token and (self.tokenizer.eos_token not in stop):
             stop.append(self.tokenizer.eos_token)
+        for s in self._extra_stop_words:
+            if s not in stop:
+                stop.append(s)
         ttokenizer = None if TransformerTokenizer is None else TransformerTokenizer(tokenizer=self.tokenizer)
         token_ids = inference_plan.token_ids
         cache = inference_plan.cache
@@ -1048,7 +1105,12 @@ class LLMModel:
             self.log(f'{token_generated} tokens generated. Time taken: {gen_end - start:.3f}s. {tps:.3f} t/s.')
             if self.enable_cache:
                 try:
-                    self.cache_manager.save_cache(cache, token_ids=token_ids[:, :-1], offsets=offsets, create_cache_fn=self.get_empty_cache, images=inference_plan.b64_images)
+                    self.cache_manager.save_cache(cache, 
+                        token_ids=token_ids[:, :-1], 
+                        offsets=offsets, 
+                        create_cache_fn=self.get_empty_cache, 
+                        images=inference_plan.b64_images,
+                        image_diffs=image_diffs)
                 except:
                     pass
             try:
@@ -1070,7 +1132,7 @@ class LLMModel:
         import mlx.core as mx
         imgs = [None] if images is None else images 
         inference_plan = self.create_inference_plan(prompts=prompts, images=images if any(img is not None for img in imgs) else None)
-        logits = self.process_prompt(inference_plan)
+        logits, image_diffs = self.process_prompt(inference_plan)
         
         # Make duplicates of everything for n > 1
         if n > 1:
@@ -1083,11 +1145,14 @@ class LLMModel:
             logits = mx.repeat(logits, repeats=n, axis=0)
             if inference_plan.b64_images is not None:
                 new_images = []
-                for il in inference_plan.b64_images:
+                new_image_diffs = []
+                for i, il in enumerate(inference_plan.b64_images):
+                    new_image_diffs.extend([image_diffs[i]] * n)
                     new_images.extend([il] * n)
                 inference_plan.b64_images = il
+                image_diffs = new_image_diffs
         
-        return self._stream(inference_plan, logits=logits, sampling_params=sampling_params, is_thinking=is_thinking)
+        return self._stream(inference_plan, logits=logits, image_diffs=image_diffs, sampling_params=sampling_params, is_thinking=is_thinking)
     
     def generate(
             self,

@@ -13,7 +13,8 @@ def serve_api(
         min_tokens: int = 20,
         max_reprocess_tokens: int = 250,
         replace_threshold: float = 0.95,
-        max_capacity: int = 50
+        max_capacity: int = 50,
+        use_reasoning_content: bool = False
     ):
     from .engine import InferenceEngine
     from .utils import PACKAGE_NAME
@@ -32,6 +33,7 @@ def serve_api(
         max_reprocess_tokens=max_reprocess_tokens,
         replace_threshold=replace_threshold,
         max_capacity=max_capacity,
+        use_reasoning_content=use_reasoning_content,
         logger=logger
     )
     api_keys = api_keys if api_keys else []
@@ -55,10 +57,38 @@ def serve_api(
             if len(alt['prompt']) > 200:
                 alt['prompt'] = alt['prompt'][:100] + '...' + alt['prompt'][-100:]
         
-        # if 'messages' in alt:
-        #     mstr = json.dumps(alt['messages'])
-        #     if len(mstr) > 200:
-        #         alt['messages'] = mstr[:100] + '...' +  mstr[-100:]
+        if 'messages' in alt:
+            for msgs in alt['messages']:
+                if not isinstance(msgs, list):
+                    if isinstance(msgs.get('content'), list):
+                        for c in msgs['content']:
+                            img = c.get('image_url')
+                            if img:
+                                if isinstance(img, dict):
+                                    img['url'] = img['url'] if not img['url'].startswith('data:') else 'base64image_string'
+                            text = c.get('text')
+                            if text and (len(text) > 200):
+                                c['text'] = text[:99] + '...' + text[-99:]
+                    elif isinstance(msgs.get('content'), str):
+                        text = msgs['content']
+                        if len(text) > 200:
+                            msgs['content'] = text[:99] + '...' + text[-99:]
+                else:
+                    for msg in msgs:
+                        if isinstance(msg.get('content'), list):
+                            for c in msg['content']:
+                                img = c.get('image_url')
+                                if img:
+                                    if isinstance(img, dict):
+                                        img['url'] = img['url'] if not img['url'].startswith('data:') else 'base64image_string'
+                                text = c.get('text')
+                                if text and (len(text) > 200):
+                                    c['text'] = text[:99] + '...' + text[-99:]
+                        elif isinstance(msg.get('content'), str):
+                            text = msg['content']
+                            if len(text) > 200:
+                                msg['content'] = text[:99] + '...' + text[-99:]
+
         
         logger.info(json.dumps(alt, indent=2))
 
@@ -101,8 +131,8 @@ def serve_api(
                             yield f'data: {chunk.model_dump_json()}\n\n'
                         yield 'data: [DONE]'
                     except Exception as e:
-                        logger.error(e)
-                        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+                        logger.error(str(e)[:500])
+                        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)[:500])
                 return StreamingResponse(gen(), media_type="text/event-stream")
             
             else:
@@ -110,8 +140,8 @@ def serve_api(
                     output = await asyncio.to_thread(engine.generate, **content)
                     return JSONResponse(jsonable_encoder(output.model_dump()))
                 except Exception as e:
-                    logger.error(e)
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+                    logger.error(str(e)[:500])
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)[:500])
                 
     @app.post('/v1/chat/completions',  response_model=None)
     async def completions(request: Request) -> Union[StreamingResponse, JSONResponse]:
@@ -139,8 +169,8 @@ def serve_api(
                             yield f'data: {chunk.model_dump_json()}\n\n'
                         yield 'data: [DONE]'
                     except Exception as e:
-                        logger.error(e)
-                        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+                        logger.error(str(e)[:500])
+                        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)[:500])
                 return StreamingResponse(gen(), media_type="text/event-stream")
             
             else:

@@ -435,10 +435,7 @@ class ChatTemplate:
                             image_str = c.image_url.url
                         else:
                             image_str = c.image_url
-                        if image_str.startswith('data:image/jpeg;base64,'):
-                            images.append(image_str.removeprefix('data:image/jpeg;base64,'))
-                        else:
-                            images.append(image_str)
+                        images.append(image_str)
         images = images if images else None
 
 
@@ -462,7 +459,7 @@ class ChatTemplate:
 
         if self._ban_none_content:
             msgs = [self._content_to_str_with_tool_call(m) for m in msgs] 
-        
+            
         prompt = self.tokenizer.apply_chat_template(conversation=msgs, 
             tools=tools if self.support_tool_call else None, tokenize=False, 
             add_generation_prompt=add_generation_prompt, 

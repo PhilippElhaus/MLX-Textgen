@@ -360,7 +360,18 @@ class InferenceEngine:
 
         self.load_model(model)
 
-        if self.model.chat_template.reasoning_start:
+        multi_msgs = isinstance(messages[0], list)
+        end_roles = [msgs[-1]['role'] for msgs in messages] if multi_msgs else [messages[-1]['role']]
+        role_check = end_roles[0]
+        if any(r != role_check for r in end_roles):
+            error = 'Different message sequences have different roles for the last message.'
+            self.log(error, 'error')
+            raise ValueError(error)
+        
+        if role_check == 'assistant':
+            _max_reasoning_tokens = 0
+
+        elif self.model.chat_template.reasoning_start:
             rmap = dict(low=512, medium=2048, high=4096)
             if max_reasoning_tokens is not None:
                 _max_reasoning_tokens = max_reasoning_tokens
@@ -446,7 +457,7 @@ class InferenceEngine:
             raise ValueError(error)
         
         
-        msgs = [messages] if isinstance(messages[0], dict) else msgs
+        msgs = [messages] if isinstance(messages[0], dict) else messages
         for m in msgs:
             if len(m) == 0:
                 error = 'Cannot have empty messages sequences.'

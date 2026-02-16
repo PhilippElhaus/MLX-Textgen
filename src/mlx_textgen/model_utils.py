@@ -187,8 +187,8 @@ def find_conseq_indices_pairs(input_list: List[int], batch_size: int) -> List[Tu
     return output
 
 def make_model_exist(model_id_or_path: str, **kwargs):
-    import os
     from pathlib import Path
+    import os
 
     is_dir = os.path.exists(model_id_or_path)
 
@@ -196,8 +196,13 @@ def make_model_exist(model_id_or_path: str, **kwargs):
         model_path = Path(model_id_or_path)
     
     else:
-        from mlx_lm.utils import get_model_path
-        model_path = get_model_path(model_id_or_path, revision=kwargs.pop('revision', None))
+        revision = kwargs.pop('revision', None)
+        try:
+            from mlx_lm.utils import get_model_path
+            model_path = get_model_path(model_id_or_path, revision=revision)
+        except (ImportError, AttributeError):
+            from huggingface_hub import snapshot_download
+            model_path = Path(snapshot_download(repo_id=model_id_or_path, revision=revision))
 
     return model_path
 
@@ -588,8 +593,13 @@ class LLMModel:
             model_path = Path(model_id_or_path)
         
         else:
-            from mlx_lm.utils import get_model_path
-            model_path = get_model_path(model_id_or_path, revision=kwargs.pop('revision', None))
+            revision = kwargs.pop('revision', None)
+            try:
+                from mlx_lm.utils import get_model_path
+                model_path = get_model_path(model_id_or_path, revision=revision)
+            except (ImportError, AttributeError):
+                from huggingface_hub import snapshot_download
+                model_path = Path(snapshot_download(repo_id=model_id_or_path, revision=revision))
 
         self._model_local_path = str(model_path)
 
@@ -623,14 +633,20 @@ class LLMModel:
         import time
         from pathlib import Path
         from mlx.core import clear_cache
-        from mlx_lm.utils import get_model_path, load_model
+        from mlx_lm.utils import load_model
 
         start = time.perf_counter()
         is_dir = os.path.exists(model_id_or_path)
         if is_dir:
             model_path = Path(model_id_or_path)
         else:
-            model_path = get_model_path(model_id_or_path, revision=kwargs.pop('revision', None))
+            revision = kwargs.pop('revision', None)
+            try:
+                from mlx_lm.utils import get_model_path
+                model_path = get_model_path(model_id_or_path, revision=revision)
+            except (ImportError, AttributeError):
+                from huggingface_hub import snapshot_download
+                model_path = Path(snapshot_download(repo_id=model_id_or_path, revision=revision))
 
         self._draft_model, self._draft_config = load_model(model_path=model_path, model_config=kwargs if kwargs else {})
         clear_cache()

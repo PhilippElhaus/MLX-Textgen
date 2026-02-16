@@ -22,6 +22,8 @@ class ModelConfig(BaseModel):
     tokenizer_repo_or_path: Optional[str] = None
     model_kwargs: Optional[Dict[str, Any]] = None
     tokenizer_kwargs: Optional[Dict[str, Any]] = None
+    draft_model_id_or_path: Optional[str] = None
+    num_draft_tokens: Optional[int] = None
     model_name: Optional[str] = None
     enable_cache: bool = True
     preprocess_batch_size: int = 512
@@ -61,6 +63,8 @@ class InferenceEngine:
                 self._model_dict[model_name] = mc
                 kwargs = mc.model_kwargs if mc.model_kwargs else dict()
                 make_model_exist(model_id_or_path=mc.model_id_or_path, **kwargs)
+                if mc.draft_model_id_or_path:
+                    make_model_exist(model_id_or_path=mc.draft_model_id_or_path)
             else:
                  msg = f'More than one model is named as "{model_name}". Please set the "model_name" argument differently for these models.'
                  self.log(msg, 'error')
@@ -116,7 +120,9 @@ class InferenceEngine:
             root='root',
             info=dict(
                 tokenizer_id=config.tokenizer_repo_or_path if config.tokenizer_repo_or_path else config.model_id_or_path,
-                tokenizer_kwargs=config.tokenizer_kwargs
+                tokenizer_kwargs=config.tokenizer_kwargs,
+                draft_model_id_or_path=config.draft_model_id_or_path,
+                num_draft_tokens=config.num_draft_tokens
             )
         )
         return config
@@ -145,6 +151,8 @@ class InferenceEngine:
             tokenizer_repo_or_path=mc.tokenizer_repo_or_path,
             model_kwargs=mc.model_kwargs,
             tokenizer_kwargs=mc.tokenizer_kwargs,
+            draft_model_id_or_path=mc.draft_model_id_or_path,
+            num_draft_tokens=mc.num_draft_tokens,
             model_name=mc.model_name,
             logger=self._logger,
             enable_cache=mc.enable_cache,

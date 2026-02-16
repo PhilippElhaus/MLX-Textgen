@@ -209,6 +209,8 @@ class LLMModel:
             tokenizer_repo_or_path: Optional[str] = None,
             model_kwargs: Optional[Dict[str, Any]] = None,
             tokenizer_kwargs: Optional[Dict[str, Any]] = None,
+            draft_model_id_or_path: Optional[str] = None,
+            num_draft_tokens: Optional[int] = None,
             model_name: Optional[str] = None,
             logger: Optional["Logger"] = None,
             verbose: bool = True,
@@ -229,12 +231,20 @@ class LLMModel:
         if isinstance(self._extra_stop_words, str):
             self._extra_stop_words = [self._extra_stop_words]
         self._tokenizer_repo_or_path = tokenizer_repo_or_path if tokenizer_repo_or_path else model_id_or_path
-        model_kwargs = model_kwargs if model_kwargs else {}
-        tokenizer_kwargs = tokenizer_kwargs if tokenizer_kwargs else {}
+        model_kwargs = dict(model_kwargs) if model_kwargs else {}
+        tokenizer_kwargs = dict(tokenizer_kwargs) if tokenizer_kwargs else {}
+        tokenizer_kwargs.setdefault("fix_mistral_regex", True)
+        self._draft_model_id_or_path = draft_model_id_or_path
+        self._num_draft_tokens = num_draft_tokens if num_draft_tokens is not None else 4
         self._model_name = model_name
 
         self._load_model_and_config(model_id_or_path=model_id_or_path, **model_kwargs)
         self._load_processor(tokenizer_repo_or_path=self._tokenizer_repo_or_path, **tokenizer_kwargs)
+        if self._draft_model_id_or_path:
+            if self.is_vision:
+                self.log(f'Draft model is configured for "{self.model_name}" but speculative decoding is disabled for vision models.', level='warning')
+            else:
+                self._load_draft_model_and_config(model_id_or_path=self._draft_model_id_or_path)
 
         self._enable_cache = enable_cache
         self._preprocess_batch_size = preprocess_batch_size
@@ -304,6 +314,18 @@ class LLMModel:
             Module: The loaded model.
         """
         return self._model
+
+    @property
+    def draft_model(self) -> Optional["Module"]:
+        return getattr(self, "_draft_model", None)
+
+    @property
+    def num_draft_tokens(self) -> int:
+        return self._num_draft_tokens
+
+    @property
+    def use_speculative_decoding(self) -> bool:
+        return (self.draft_model is not None) and (not self.is_vision)
     
     @property
     def config(self) -> Dict[str, Any]:
@@ -589,8 +611,31 @@ class LLMModel:
         import gc
 
         del self._model, self._tokenizer, self._processor, self._chat_template, self._config, self._cache_manager
+        if hasattr(self, "_draft_model"):
+            del self._draft_model
+        if hasattr(self, "_draft_config"):
+            del self._draft_config
         mx.clear_cache()
         gc.collect()
+
+    def _load_draft_model_and_config(self, model_id_or_path: str, **kwargs) -> None:
+        import os
+        import time
+        from pathlib import Path
+        from mlx.core import clear_cache
+        from mlx_lm.utils import get_model_path, load_model
+
+        start = time.perf_counter()
+        is_dir = os.path.exists(model_id_or_path)
+        if is_dir:
+            model_path = Path(model_id_or_path)
+        else:
+            model_path = get_model_path(model_id_or_path, revision=kwargs.pop('revision', None))
+
+        self._draft_model, self._draft_config = load_model(model_path=model_path, model_config=kwargs if kwargs else {})
+        clear_cache()
+        end = time.perf_counter()
+        self.log(f'Draft model loaded for "{self.model_name}" from "{model_id_or_path}". Time taken: {end - start:.3f}s.')
 
     def _get_detokenizer_class(self, tokenizer_repo_or_path: str) -> None:
         """Determines the appropriate detokenizer class based on the tokenizer configuration.
@@ -624,7 +669,10 @@ class LLMModel:
                 self.log(f'Model "{self.model_name}" is using SPM decoder with trim_space=False.')
                 detokenizer_class = partial(SPMDetokenizer, trim_space=False)
             else:
-                self.log(f'Model "{self.model_name}" is using Naive decoder.')
+                if self._draft_model_id_or_path:
+                    self.log(f'Model "{self.model_name}" is using NaiveDetokenizer for tokenizer streaming.')
+                else:
+                    self.log(f'Model "{self.model_name}" is using Naive decoder.')
 
         self._detokenizer_class = detokenizer_class
 
@@ -656,7 +704,21 @@ class LLMModel:
         else:
             from transformers import AutoTokenizer
             self._processor = None
-            self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo_or_path, **kwargs)
+            kwargs = dict(kwargs) if kwargs else {}
+            kwargs.setdefault("fix_mistral_regex", True)
+            try:
+                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo_or_path, **kwargs)
+            except TypeError as e:
+                if "multiple values for keyword argument 'fix_mistral_regex'" not in str(e):
+                    raise
+                # Work around affected transformers builds that pass fix_mistral_regex twice internally.
+                retry_kwargs = dict(kwargs)
+                retry_kwargs.pop("fix_mistral_regex", None)
+                self.log(
+                    'Detected transformers fix_mistral_regex kwarg collision; retrying tokenizer load without explicit fix_mistral_regex.',
+                    level='warning'
+                )
+                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo_or_path, **retry_kwargs)
             if not self._tokenizer.pad_token:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
 
@@ -679,6 +741,13 @@ class LLMModel:
 
         model = self.model.language_model if self.is_vision else self.model
         return make_prompt_cache(model)
+
+    def get_empty_draft_cache(self) -> List[Union["KVCache", "RotatingKVCache"]]:
+        from mlx_lm.models.cache import make_prompt_cache
+
+        if self.draft_model is None:
+            return []
+        return make_prompt_cache(self.draft_model)
 
     def prepare_inputs(self,
             prompts: Union[str, List[str]],
@@ -982,6 +1051,124 @@ class LLMModel:
         ]
         return output
 
+    def _can_use_speculative(self, sampling_params: "SamplingParams", n: int, batch_size: int) -> bool:
+        if not self.use_speculative_decoding:
+            return False
+        try:
+            from mlx_lm.generate import speculative_generate_step  # noqa: F401
+        except Exception:
+            return False
+        if n != 1 or batch_size != 1:
+            return False
+        if sampling_params.guided_json is not None:
+            return False
+        if sampling_params.guided_choice is not None:
+            return False
+        if sampling_params.guided_regex is not None:
+            return False
+        if sampling_params.guided_grammar is not None:
+            return False
+        if sampling_params.logit_bias is not None:
+            return False
+        if sampling_params.frequency_penalty != 0.0:
+            return False
+        if sampling_params.presence_penalty != 0.0:
+            return False
+        if sampling_params.repetition_penalty != 1.0:
+            return False
+        return True
+
+    def _stream_speculative(self, inference_plan: InferencePlan, sampling_params: "SamplingParams", is_thinking: bool = False) -> Iterator[List["GenerationOutput"]]:
+        from time import perf_counter
+        from .generation_utils import StringStop, GenerationOutput
+        from mlx_lm.generate import speculative_generate_step
+        from mlx_lm.sample_utils import make_sampler
+        import mlx.core as mx
+
+        start = perf_counter()
+        max_tokens = sampling_params.max_reasoning_tokens if is_thinking else sampling_params.max_completion_tokens
+        stop = list(sampling_params.stop) if sampling_params.stop else []
+        if self.tokenizer.eos_token and (self.tokenizer.eos_token not in stop):
+            stop.append(self.tokenizer.eos_token)
+        for s in self._extra_stop_words:
+            if s not in stop:
+                stop.append(s)
+
+        token_ids = inference_plan.token_ids
+        offsets = inference_plan.offsets
+        input_tokens = ((offsets * -1) + token_ids.shape[1]).tolist()
+        detokenizer = self.detokenizer_class(tokenizer=self.tokenizer)
+        stopper = StringStop(num_prompt=1, stop=stop)
+
+        if sampling_params.seed is not None:
+            mx.random.seed(sampling_params.seed)
+
+        sampler = make_sampler(
+            temp=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            min_p=sampling_params.min_p,
+            min_tokens_to_keep=sampling_params.min_tokens_to_keep,
+            top_k=sampling_params.top_k if sampling_params.top_k else 0
+        )
+        prompt = token_ids[0]
+        token_generator = speculative_generate_step(
+            prompt=prompt,
+            model=self.model,
+            draft_model=self.draft_model,
+            num_draft_tokens=self.num_draft_tokens,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            prompt_cache=self.get_empty_cache() + self.get_empty_draft_cache()
+        )
+
+        def gen_tokens():
+            nonlocal token_ids
+            output_tokens = 0
+            for token, logprobs, _ in token_generator:
+                token_id = int(token.item() if hasattr(token, "item") else token)
+                new_tokens = mx.array([[token_id]], dtype=token_ids.dtype)
+                detokenizer.add_tokens([[token_id]])
+                token_ids = mx.concat([token_ids, new_tokens], axis=1)
+                new_str_tokens_obj = stopper.get_finalised_token_strings(tokens=detokenizer.last_segments)
+                new_str_tokens = [o.new_token for o in new_str_tokens_obj]
+                stop_strings = [o.stop_str for o in new_str_tokens_obj]
+                output_tokens += 1
+
+                logprob_list = None
+                if sampling_params.logprobs:
+                    row_range = mx.arange(1).reshape(-1, 1)
+                    current_logprobs = logprobs.reshape(1, -1) if len(logprobs.shape) == 1 else logprobs
+                    logprob_list = self._get_logprobs(
+                        current_logprobs,
+                        new_tokens,
+                        current_tokens=new_str_tokens,
+                        top_logprobs=sampling_params.top_logprobs,
+                        row_range=row_range
+                    )
+
+                gos = [
+                    GenerationOutput(
+                        index=0,
+                        token=new_str_tokens[0],
+                        token_id=token_id,
+                        stop_str=stop_strings[0],
+                        logprobs=logprob_list[0] if sampling_params.logprobs else None,
+                        input_tokens=input_tokens[0],
+                        output_tokens=output_tokens,
+                        finish_reason='stop' if stop_strings[0] else ('length' if output_tokens == max_tokens else None)
+                    )
+                ]
+                yield gos
+                if stop_strings[0] or (output_tokens == max_tokens):
+                    break
+
+            mx.clear_cache()
+            gen_end = perf_counter()
+            tps = output_tokens / (gen_end - start) if output_tokens > 0 else 0.0
+            self.log(f'{output_tokens} tokens generated with speculative decoding. Time taken: {gen_end - start:.3f}s. {tps:.3f} t/s.')
+
+        return gen_tokens()
+
     def _stream(self, inference_plan: InferencePlan, logits: "array", image_diffs: List[List[int]], sampling_params: "SamplingParams", is_thinking: bool = False) -> Iterator[List["GenerationOutput"]]:
         from time import perf_counter
 
@@ -1132,6 +1319,14 @@ class LLMModel:
         import mlx.core as mx
         imgs = [None] if images is None else images 
         inference_plan = self.create_inference_plan(prompts=prompts, images=images if any(img is not None for img in imgs) else None)
+        if self._can_use_speculative(sampling_params=sampling_params, n=n, batch_size=inference_plan.token_ids.shape[0]):
+            self.log(f'Using speculative decoder (draft="{self._draft_model_id_or_path}", num_draft_tokens={self.num_draft_tokens}).')
+            return self._stream_speculative(inference_plan=inference_plan, sampling_params=sampling_params, is_thinking=is_thinking)
+        elif self.use_speculative_decoding:
+            self.log('Draft model configured but request is not eligible for speculative decoding; using standard decoding path.', level='debug')
+        else:
+            self.log('Using naive decoding path.', level='debug')
+
         logits, image_diffs = self.process_prompt(inference_plan)
         
         # Make duplicates of everything for n > 1
@@ -1199,6 +1394,3 @@ class LLMModel:
         
         
     
-
-
-

@@ -51,6 +51,8 @@ model_configs:
   tokenizer_repo_or_path: null
   model_kwargs: null
   tokenizer_kwargs: null
+  draft_model_id_or_path: null
+  num_draft_tokens: null
   model_name: null
   enable_cache: true
   preprocess_batch_size: 512
@@ -61,6 +63,8 @@ model_configs:
   tokenizer_repo_or_path: null
   model_kwargs: null
   tokenizer_kwargs: null
+  draft_model_id_or_path: null
+  num_draft_tokens: null
   model_name: null
   enable_cache: true
   preprocess_batch_size: 512

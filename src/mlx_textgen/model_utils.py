@@ -238,7 +238,6 @@ class LLMModel:
         self._tokenizer_repo_or_path = tokenizer_repo_or_path if tokenizer_repo_or_path else model_id_or_path
         model_kwargs = dict(model_kwargs) if model_kwargs else {}
         tokenizer_kwargs = dict(tokenizer_kwargs) if tokenizer_kwargs else {}
-        tokenizer_kwargs.setdefault("fix_mistral_regex", True)
         self._draft_model_id_or_path = draft_model_id_or_path
         self._num_draft_tokens = num_draft_tokens if num_draft_tokens is not None else 4
         self._model_name = model_name
@@ -734,7 +733,20 @@ class LLMModel:
                     'Detected transformers fix_mistral_regex kwarg collision; retrying tokenizer load without explicit fix_mistral_regex.',
                     level='warning'
                 )
-                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo_or_path, **retry_kwargs)
+                try:
+                    self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo_or_path, **retry_kwargs)
+                except TypeError as e2:
+                    if "multiple values for keyword argument 'fix_mistral_regex'" not in str(e2):
+                        raise
+                    # Last-resort compatibility path for affected tokenizers/transformers combos.
+                    # Slow tokenizer avoids the fast backend path where this collision occurs.
+                    fallback_kwargs = dict(retry_kwargs)
+                    fallback_kwargs["use_fast"] = False
+                    self.log(
+                        'Tokenizer kwarg collision persisted; falling back to use_fast=False for compatibility.',
+                        level='warning'
+                    )
+                    self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo_or_path, **fallback_kwargs)
             if not self._tokenizer.pad_token:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
 
